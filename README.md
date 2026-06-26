@@ -1,2 +1,2 @@
 # ViPER
-ViPER: Vision Positional Encoding Representation with Hierarchical Dynamic Wavelet Encoding
+ViPER: Vision Positional Encoding Representation with Multiscale Dynamic Wavelet Encoding
