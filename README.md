@@ -15,7 +15,6 @@ viper-wacv2027/
 ├── LICENSE                       MIT (post-publication)
 ├── requirements.txt              Pinned dependencies
 ├── .gitignore
-├── anonymize_check.sh            Identifier scanner (run before final upload)
 │
 ├── viper/                        Library package
 │   ├── __init__.py               Public API
@@ -48,26 +47,11 @@ conda activate viper
 pip install -r requirements.txt
 ```
 
-Key dependencies (pinned in `requirements.txt`):
-
-| Package | Version | Purpose |
-|---|---|---|
-| `torch` | 2.5.1 | Deep learning |
-| `torchvision` | 0.20.1 | EuroSAT, DTD, Flowers102, FGVCAircraft loaders |
-| `timm` | 1.0.11 | DeiT-Tiny backbone |
-| `pytorch_wavelets` | 1.3.0 | 2D-DWT — ViPER's only specialized dependency |
-| `medmnist` | 3.0.2 | BloodMNIST, DermaMNIST, PathMNIST, TissueMNIST |
-| `datasets` | 2.21.0 | RESISC45 (HuggingFace) |
-| `scikit-learn` | 1.5.0 | F1, AUC metrics |
-
----
-
 ### Hardware
 
 All paper results were produced on a single NVIDIA RTX A5000 (24 GB).
 Minimum requirement: one GPU with at least **6 GB VRAM**.
 
----
 
 ### Datasets
 
@@ -97,7 +81,7 @@ Each downloads on first use to `data_root` (default `./data`).
 
 All commands are run from the **repository root**.
 
-#### Table 3 — From-scratch comparison
+#### Table 3 - From-scratch comparison
 
 ViT-Tiny trained from scratch on three datasets, 100 epochs each:
 
@@ -109,7 +93,7 @@ for ds in eurosat bloodmnist dermamnist; do
 done
 ```
 
-#### Table 4 — Extended BloodMNIST comparison (attention-internal PEs)
+#### Table 4 - Extended BloodMNIST comparison (attention-internal PEs)
 
 The five standard PEs from Table 5 plus the two attention-internal ones:
 
@@ -126,7 +110,7 @@ python scripts/train.py --dataset bloodmnist --pe alibi2d \
     --epochs 50 --seeds 0 1 42 123 7
 ```
 
-#### Table 5 — Main pretrained comparison (5 datasets × 6 methods × 5 seeds)
+#### Table 5 - Main pretrained comparison (5 datasets × 6 methods × 5 seeds)
 
 ```bash
 for ds in eurosat bloodmnist dermamnist dtd resisc45; do
@@ -140,7 +124,7 @@ Per-run JSONs land in `outputs/<dataset>/runs/{method}_seed{N}.json`.
 Each file contains test accuracy, F1, AUC, per-epoch training history,
 parameter counts, and runtime.
 
-#### Table 6 + Figure 5 — Resolution generalization
+#### Table 6 + Figure 5 - Resolution generalization
 
 Two stages: train with `--save_checkpoints`, then evaluate at multiple
 resolutions.
@@ -166,7 +150,7 @@ and `viper`.
 
 Output: `outputs/bloodmnist/multires_eval/multires_bloodmnist.json`.
 
-#### Table 7 — Multi-resolution training
+#### Table 7 - Multi-resolution training
 
 A single model trained with resolutions sampled per-batch from the chosen
 set, then evaluated at the standard five test resolutions:
@@ -194,7 +178,7 @@ python scripts/eval_multires.py \
     --checkpoint_dir outputs/bloodmnist_multires/checkpoints
 ```
 
-### Table 8 — Computational efficiency
+### Table 8 - Computational efficiency
 
 The throughput numbers in Table 8 (params, FLOPs, img/s, slowdown) are
 measured per PE method on the same DeiT-Tiny backbone at batch size 32.
@@ -230,13 +214,6 @@ done
 After every batch of runs, a summary file `summary_<pe>.json` is also
 written at the top level of `outputs/<dataset>/`.
 
-
-## Determinism
-
-`viper.trainer.set_seed` seeds PyTorch, NumPy, and Python's `random` at
-the start of every run. CUDA reduction kernels retain a small amount of
-non-determinism, so re-runs with identical seeds match the paper to
-within ±0.05 pp.
 
 
 ## License
