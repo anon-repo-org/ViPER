@@ -1,0 +1,32 @@
+# =====================================================================
+# ViPER — pinned dependencies
+#
+# Tested with Python 3.10 + CUDA 12.1 on Ubuntu 20.04.
+# Newer minor versions of each package should be compatible.
+# =====================================================================
+
+# Core deep learning
+torch==2.5.1
+torchvision==0.20.1
+
+# Backbones
+timm==1.0.11
+
+# Wavelets — ViPER's only specialized dependency
+pytorch_wavelets==1.3.0
+PyWavelets==1.6.0
+
+# Datasets
+medmnist==3.0.2
+datasets==2.21.0
+
+# Scientific stack
+numpy==1.26.4
+scipy==1.13.1
+scikit-learn==1.5.0
+
+# Progress + logging
+tqdm==4.66.4
+
+# Plotting (only used by analysis scripts; safe to omit at training time)
+matplotlib==3.9.1
