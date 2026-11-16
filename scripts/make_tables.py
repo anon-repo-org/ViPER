@@ -1,0 +1,1749 @@
+#!/usr/bin/env python
+"""Generate every LaTeX table of the paper from results/ (never edit the .tex by hand).
+
+python scripts/make_tables.py            # -> paper/tables/*.tex (+ paper/tables/status.md)
+
+Missing runs are shown as "--"; cells with fewer than the planned seeds carry a
+superscript seed count so a partially filled table is never mistaken for the final one.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+from collections import defaultdict
+import json
+import os
+import sys
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from stats import (correctness, holm, load_group, mcnemar, mean_std, paired_bootstrap,  # noqa: E402
+                   paired_seed_test, seed_values)
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RES = os.path.join(ROOT, "results")
+OUT = os.path.join(ROOT, "paper", "tables")
+N_SEEDS = 3          # every method vs the baselines; the gate comparison is paired over 5 (stats.FIVE_SEED_METHODS)
+OURS = "viper"
+
+# display name, family, citation key (bib keys in paper/main.bib)
+PE_INFO = {
+    "none": ("No PE", "None", None),
+    "learned": ("APE (learned)", "Absolute", "dosovitskiy2021vit"),
+    "sincos": ("2D sin-cos", "Absolute", "he2022mae"),
+    "fourier": ("Learnable Fourier", "Absolute", "li2021learnable"),
+    "cpe": ("CPE / PEG", "Conditional", "chu2023cpvt"),
+    "lepe": ("LePE", "Conditional", "dong2022cswin"),
+    "relbias": ("RPB", "Relative bias", "liu2021swin"),
+    "alibi": ("2D-ALiBi", "Relative bias", "fuller2023croma"),
+    "lookhere": ("LookHere", "Relative bias", "fuller2024lookhere"),
+    "pape": ("PaPE", "Relative bias", "pape2026"),
+    "rope_axial": ("RoPE-Axial", "Rotary", "heo2024rope"),
+    "rope_mixed": ("RoPE-Mixed", "Rotary", "heo2024rope"),
+    "liere": ("LieRE", "Rotary", "ostmeier2025liere"),
+    "comrope_ld": ("ComRoPE-LD", "Rotary", "yu2025comrope"),
+    "string_cayley": ("STRING", "Rotary", "schenck2025string"),
+    "spiral": ("Spiral RoPE", "Rotary", "spiral2026"),
+    "carope": ("CARoPE (2D port)", "Rotary", "veisi2025carope"),
+    "irpe": ("iRPE (contextual)", "Relative bias", "wu2021irpe"),
+    "dpb": ("CrossFormer DPB", "Relative bias", "wang2022crossformer"),
+    "gpsa": ("ConViT GPSA", "Relative bias", "dascoli2021convit"),
+    "wavelet_rpe": ("Wavelet RPE (2D port)", "Relative bias", "oka2025waveletpe"),
+    "viper": ("\\textbf{ViPER (ours)}", "Ours", None),
+}
+FAMILY_ORDER = ["None", "Absolute", "Conditional", "Relative bias", "Rotary", "Content", "Ours"]
+
+ABLATION_INFO = {
+    "viper": "ViPER",
+    "abl_no_gates": "ViPER w/o gates",
+    "abl_static_gate": "static gates",
+    "abl_rgb_gate": "RGB gates",
+    "abl_no_value": "w/o value path",
+    "abl_gate_qk": "gates on $q$ and $k$",
+    "abl_dyadic": "dyadic grid",
+    "abl_axial_base": "fixed axial freq.",
+    "abl_shared_gate": "one gate shared by all layers",
+    "abl_haar": "Haar instead of db4",
+    "abl_levels2": "$J{=}2$ wavelet levels (vs.\\ 4)",
+    "abl_no_ll": "w/o low-pass (LL) energy",
+    "abl_no_ctxconv": "w/o $3{\\times}3$ context conv",
+    "abl_bands2": "$B{=}2$ bands (vs.\\ 4)",
+    "abl_bands8": "$B{=}8$ bands (vs.\\ 4)",
+}
+
+
+# --------------------------------------------------------------------------- formatting
+def fmt(vals: dict, std=True, prec=2):
+    m, s, n = mean_std(vals.values())
+    if n == 0:
+        return "--", np.nan
+    txt = f"{m:.{prec}f}"
+    if std and n > 1:
+        txt += f"{{\\scriptsize$\\pm${s:.{prec}f}}}"
+    if n < N_SEEDS:
+        txt += f"$^{{{n}}}$"
+    return txt, m
+
+
+def fmt_abl(vals: dict, std=True, prec=2):
+    """fmt for ablation rows: with two seeds the SD is replaced by the range of the two values."""
+    if len(vals) == 2 and std:
+        lo, hi = sorted(vals.values())
+        m = (lo + hi) / 2
+        return f"{m:.{prec}f}{{\\scriptsize\\,[{lo:.{prec}f},\\,{hi:.{prec}f}]}}$^{{2}}$", m
+    return fmt(vals, std=std, prec=prec)
+
+
+def rank_marks(cells: list[tuple[str, float]]):
+    """bold best, underline second (higher is better)."""
+    vals = [m for _, m in cells if m == m]
+    if not vals:
+        return [c for c, _ in cells]
+    order = sorted(set(vals), reverse=True)
+    best, second = order[0], (order[1] if len(order) > 1 else None)
+    out = []
+    for c, m in cells:
+        if m == m and m == best:
+            c = f"\\textbf{{{c}}}"
+        elif second is not None and m == m and m == second:
+            c = f"\\underline{{{c}}}"
+        out.append(c)
+    return out
+
+
+def name_cell(pe):
+    if pe == "abl_no_gates":
+        return "ViPER w/o gates"
+    disp, _, cite = PE_INFO.get(pe, (pe.replace("_", "\\_"), "Other", None))
+    return disp            # methods are cited once, in the text (Sec. 4 baselines)
+
+
+def write(name, text):
+    os.makedirs(OUT, exist_ok=True)
+    with open(os.path.join(OUT, name), "w") as f:
+        f.write("% AUTO-GENERATED by scripts/make_tables.py -- do not edit by hand\n" + text)
+
+
+def ordered(methods):
+    fam = {m: PE_INFO.get(m, ("", "Other", None))[1] for m in methods}
+    return sorted(methods, key=lambda m: (FAMILY_ORDER.index(fam[m]) if fam[m] in FAMILY_ORDER else 99,
+                                          list(PE_INFO).index(m) if m in PE_INFO else 99))
+
+
+# --------------------------------------------------------------------------- tables
+def nll_values(gdir, m, seeds):
+    """Test negative log-likelihood per seed (from preds.npz)."""
+    out = {}
+    for sd in seeds:
+        f = os.path.join(gdir, f"{m}_s{sd}", "preds.npz")
+        if os.path.exists(f):
+            z = np.load(f)
+            lg = z["test_logits"].astype(np.float64); y = z["test_labels"].astype(np.int64)
+            lg -= lg.max(1, keepdims=True)
+            out[sd] = float((np.log(np.exp(lg).sum(1)) - lg[np.arange(len(y)), y]).mean())
+    return out
+
+
+FAM_SHORT = {"Absolute": "Abs.", "Conditional": "Cond.", "Relative bias": "Rel. bias", "Ours": "Hybrid"}
+
+
+def table_main(group="in100_deit_small", res_cols=(128, 160, 288, 384)):
+    runs = load_group(os.path.join(RES, group))
+    methods = [m for m in ordered([m for m in PE_INFO if m in runs])]
+    if not methods:
+        return "no runs"
+    # significance of ViPER vs each baseline (paired t over seeds at 224), Holm-corrected
+    sig = {}
+    if OURS in runs:
+        ours = seed_values(runs[OURS])
+        raw = {m: paired_seed_test(ours, seed_values(runs[m]))["t_p"] for m in methods if m != OURS}
+        sig = holm(raw)
+    cols = [("top1", None), ("top5", None), ("macro_f1", None)] + [("top1", r) for r in res_cols]
+    cells = {m: [fmt(seed_values(runs[m], k, r), std=(r is None)) for k, r in cols] for m in methods}
+    R = load_robust()                                   # OOD avg. and NLL, inserted after Macro-F1
+    gdir = os.path.join(RES, group)
+    for m in methods:
+        avg = {sd: np.mean([R[m][k][sd] for k, _ in ROBUST_SETS]) for sd in R.get(m, {}).get("v2", {})
+               if all(sd in R[m][k] for k, _ in ROBUST_SETS)} if m in R else {}
+        ood = fmt(avg, std=False)
+        t, v = fmt(nll_values(gdir, m, runs[m]), std=False, prec=3)
+        cells[m][3:3] = [ood, (t, -v)]                  # lower NLL is better: rank on -NLL
+    marked = {m: [] for m in methods}
+    for ci in range(len(cols) + 2):
+        col = rank_marks([cells[m][ci] for m in methods])
+        for m, c in zip(methods, col):
+            marked[m].append(c)
+    lines = []
+    fam_prev = None
+    for m in methods:
+        fam = PE_INFO.get(m, ("", "Other", None))[1]
+        if fam_prev is not None and fam != fam_prev:
+            lines.append("\\midrule")
+        fam_prev = fam
+        pv = sig.get(m)
+        ptxt = "--" if pv is None else ("$<$0.001" if pv < 1e-3 else f"{pv:.3f}")
+        cite = PE_INFO.get(m, (None, None, None))[2]                  # Table 1 cites every method (user, 2026-11-15)
+        row = (f"{name_cell(m)}{'~' + chr(92) + 'cite{' + cite + '}' if cite else ''} & {FAM_SHORT.get(fam, fam)} & "
+               + " & ".join(marked[m][:3]) + f" & {ptxt} & " + " & ".join(marked[m][3:]) + " \\\\")
+        if m == OURS:
+            row = "\\rowcolor{oursbg} " + row
+        lines.append(row)
+    if SHOW_CONTROL_MAIN and "abl_no_gates" in runs and OURS in methods:   # matched control (not ranked)
+        cc = [fmt(seed_values(runs["abl_no_gates"], k, r), std=(r is None))[0] for k, r in cols]
+        Rc = load_robust().get("abl_no_gates", {})
+        avg = {sd: np.mean([Rc[k][sd] for k, _ in ROBUST_SETS]) for sd in Rc.get("v2", {})
+               if all(sd in Rc[k] for k, _ in ROBUST_SETS)}
+        cc[3:3] = [fmt(avg, std=False)[0], fmt(nll_values(gdir, "abl_no_gates", runs["abl_no_gates"]), std=False, prec=3)[0]]
+        gray = lambda t: f"\\textcolor{{darkgray}}{{{t}}}"
+        row = (gray("ViPER w/o gates") + " & " + gray("Hybrid") + " & " + " & ".join(gray(c) for c in cc[:3])
+               + " & -- & " + " & ".join(gray(c) for c in cc[3:]) + " \\\\")
+        lines.insert(len(lines) - 1, row)
+    hdr_res = " & ".join(f"{r}" for r in res_cols)
+    tex = f"""\\begin{{table*}}[t]
+\\centering
+\\caption{{\\textbf{{Positional encodings on ImageNet-100}} (DeiT-S, trained at 224$^2$; mean{{\\scriptsize$\\pm$std}} over {N_SEEDS} seeds).
+Hybrid: rotary score path + conditional value path. $p_t$: Holm-corrected paired $t$-test vs.\\ ViPER. OOD avg.: ImageNet-v2/-Sketch/-R/-A.
+Right: other test resolutions, no fine-tuning. Best \\textbf{{bold}}, second \\underline{{underlined}}; superscript: fewer seeds.{CTL_CAP_MAIN if SHOW_CONTROL_MAIN else ""}}}
+\\label{{tab:main}}
+\\setlength{{\\tabcolsep}}{{3.5pt}}
+\\resizebox{{\\textwidth}}{{!}}{{%
+\\begin{{tabular}}{{ll cccc cc {'c' * len(res_cols)}}}
+\\toprule
+ & & \\multicolumn{{4}}{{c}}{{Test at 224}} & \\multicolumn{{2}}{{c}}{{Reliability}} & \\multicolumn{{{len(res_cols)}}}{{c}}{{Top-1 at test resolution}} \\\\
+\\cmidrule(lr){{3-6}}\\cmidrule(lr){{7-8}}\\cmidrule(lr){{9-{8 + len(res_cols)}}}
+Method & Family & Top-1 & Top-5 & Macro-F1 & $p_t$ & OOD avg. & NLL$\\downarrow$ & {hdr_res} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table*}}
+"""
+    write("tab_main_in100.tex", tex)
+    return f"{len(methods)} methods, seeds: " + ", ".join(f"{m}={len(runs[m])}" for m in methods)
+
+
+ABLATION_MAIN = ["viper", "abl_no_gates", "abl_static_gate", "abl_rgb_gate", "abl_no_value", "abl_gate_qk",
+                 "abl_dyadic", "abl_axial_base"]   # main paper; the wavelet-detail rows are in the supplement
+
+
+SHOW_CONTROL_MAIN = False   # user 2026-11-15: control (ViPER w/o gates) not in Tables 1-2; it is in the ablation
+                            # table (IN-100), the text and the IN-1k robustness table (supplement)
+CTL_CAP_MAIN = "\nViPER w/o gates (gray): matched control, not ranked (gate test in \\cref{tab:ablation})."
+
+
+def table_ablation(group="in100_deit_small", res_cols=None, full=False):
+    res_cols = res_cols or ((224, 160, 448) if full else (224, 160, 384))
+    runs = load_group(os.path.join(RES, group), five=True)      # ViPER and gate sources: 5 seeds; design rows: 3
+    names = [a for a in ABLATION_INFO if a in runs and (full or a in ABLATION_MAIN)]
+    if OURS not in runs:
+        return "no ViPER runs yet"
+    ours3 = mean_std([v for s_, v in seed_values(runs[OURS]).items() if s_ < N_SEEDS])[0]   # = Table 1
+    in1k_dir = os.path.join(RES, "in1k_deit_small")              # main table: ImageNet-1k column (ViPER and its control)
+    in1k = {}                                                     # IN-1k control is reported in the text, not here
+    show_in1k = OURS in in1k
+    lines = []
+    for a in names:
+        cells = []
+        for r in res_cols:
+            v = seed_values(runs[a], "top1", None if r == 224 else r)
+            txt, m = fmt_abl(v)
+            if a != OURS and m == m:
+                o = seed_values(runs[OURS], "top1", None if r == 224 else r)
+                d = np.mean([v[x] - o[x] for x in set(v) & set(o)])           # paired over the shared seeds
+                pt = paired_seed_test(v, o)
+                p = pt["t_p"]
+                star = "$^{*}$" if p == p and p < 0.05 and pt["n"] >= 3 else ""   # no test claims below 3 pairs
+                txt += star if not full else f" {{\\scriptsize({d:+.2f}{star})}}"   # main table: no differences
+            cells.append(txt)
+        if show_in1k:
+            if a in in1k:
+                v1, v0 = seed_values(in1k[a]), seed_values(in1k[OURS])
+                txt, m = fmt(v1, std=False)
+                if a != OURS:
+                    txt += f" {{\\scriptsize({m - np.mean(list(v0.values())):+.2f})}}"
+                cells.append(txt.replace("$^{1}$", ""))
+            else:
+                cells.append("--")
+        params = next(iter(runs[a].values()))["pe_params"]
+        if a == OURS and not full:                                 # main table: ViPER's row in bold
+            cells = [f"\\textbf{{{c}}}" for c in cells]
+            row = f"\\textbf{{{ABLATION_INFO[a]}}} & \\textbf{{{params/1e3:.1f}K}} & " + " & ".join(cells) + " \\\\"
+        else:
+            row = f"{ABLATION_INFO[a]} & {params/1e3:.1f}K & " + " & ".join(cells) + " \\\\"
+        if a == OURS:
+            row = "\\rowcolor{oursbg} " + row + "\n\\midrule\n\\multicolumn{%d}{l}{\\textit{Gate source}} \\\\" % (2 + len(res_cols) + show_in1k)
+        if a == "abl_rgb_gate":
+            row += "\n\\midrule\n\\multicolumn{%d}{l}{\\textit{Design choices}} \\\\" % (2 + len(res_cols) + show_in1k)
+        lines.append(row)
+    res_txt = ", " + " and ".join(f"{r}$^2$" for r in res_cols[1:]) if len(res_cols) > 2 else " and 160$^2$"
+    in1k_txt = " IN-1k: ImageNet-1k top-1 at $224^2$ (one seed)." if show_in1k else ""
+    in1k_head = " & IN-1k @224" if show_in1k else ""
+    cols_ = "l r " + "c" * (len(res_cols) + show_in1k)
+    xcols = "l r " + ">{\\centering\\arraybackslash}X" * (len(res_cols) + show_in1k)
+    tab_begin = ("\\begin{tabular}{" + cols_ + "}" if full else          # main: full column width (tabularx keeps
+                 "\\begin{tabularx}{\\columnwidth}{" + xcols + "}")      # the row colour gap-free)
+    tab_end = "\\end{tabular}" if full else "\\end{tabularx}"
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{{"All ablations" if full else "Ablations"} of ViPER}} (ImageNet-100, DeiT-S{"; main-paper rows plus the wavelet details" if full else ""}). Static: image-independent gates; RGB: gates from a learned $16{{\\times}}16$ patch filter; dyadic: periods 2--32 patches
+instead of the $\\theta$ grid; two seeds: mean [both values]. ViPER, gate source: 5 seeds (ViPER on seeds 0--2: {ours3:.2f}, \\cref{{{'M-' if full else ''}tab:main}}); design: superscript = seeds. Top-1 at $224^2${res_txt}{'; in parentheses the paired change w.r.t. ViPER' if full else ''};
+$^*$: paired $t$-test vs.\\ ViPER $p{{<}}0.05$.{in1k_txt}}}
+\\label{{tab:ablation{"_full" if full else ""}}}
+\\setlength{{\\tabcolsep}}{{3pt}}{'' if full else chr(92) + 'footnotesize'}
+{chr(92) + 'resizebox{' + chr(92) + 'columnwidth}{!}{%' if full else '{%'}
+{tab_begin}
+\\toprule
+Variant & Params & {' & '.join((f'Top-1 @{r}' if full else f'{r}$^2$') for r in res_cols)}{in1k_head} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+{tab_end}}}
+\\end{{table}}
+"""
+    write("tab_ablation_full.tex" if full else "tab_ablation.tex", tex)
+    return f"{len(names)} variants"
+
+
+def table_ablation_cases(group="in100_deit_small", res_cols=(224, 160, 384)):
+    """The main ablation table organised as ViPER's design space. Gate source x value
+    path: RoPE-Mixed (g=1, no value path) and RoPE-Mixed+LePE (g=1) are special cases of ViPER; static / RGB
+    gates are the alternatives for g; the remaining rows are design choices. Same runs and tests as table_ablation."""
+    runs = load_group(os.path.join(RES, group), five=True)
+    G = "\\gatecol"
+    rows = [("block", "Special cases and gate sources"),
+            ("rope_mixed", "RoPE-Mixed", "$1$", "--"),
+            ("abl_no_value", "w/o VP", f"${G}{{\\text{{wav.}}}}$", "--"),
+            ("abl_no_gates", "w/o gates", "$1$", "\\checkmark"),
+            ("abl_static_gate", "static gates", f"${G}{{w_b}}$", "\\checkmark"),
+            ("abl_rgb_gate", "RGB gates", f"${G}{{\\text{{RGB}}}}$", "\\checkmark"),
+            ("block", "Design choices"),
+            ("abl_gate_qk", "gates on $q,k$", f"${G}{{\\text{{wav.}}}}$", "\\checkmark"),
+            ("abl_dyadic", "dyadic grid", f"${G}{{\\text{{wav.}}}}$", "\\checkmark"),
+            ("abl_axial_base", "fixed freq.", f"${G}{{\\text{{wav.}}}}$", "\\checkmark")]
+    ncol = 5 + len(res_cols)
+
+    def cells(a):
+        out, delta = [], "--"
+        for r in res_cols:
+            v = seed_values(runs[a], "top1", None if r == 224 else r)
+            txt, m = fmt(v, std=(r == 224 and len(v) > 2))         # two seeds: mean only (values in the supplement)
+            if len(v) == 2:
+                txt = txt.replace("$^{2}$", "")                      # two-seed rows are named in the caption
+            if a != OURS and m == m:
+                o = seed_values(runs[OURS], "top1", None if r == 224 else r)
+                pt = paired_seed_test(v, o)
+                star = "$^{*}$" if pt["t_p"] == pt["t_p"] and pt["t_p"] < 0.05 and pt["n"] >= 3 else ""
+                txt += star
+                if r == 224:
+                    sh = set(v) & set(o)
+                    delta = f"${np.mean([v[x] - o[x] for x in sh]):+.2f}^{{{len(sh)}}}$"
+            out.append(txt)
+        return [delta] + out
+
+    p = lambda a: f"{next(iter(runs[a].values()))['pe_params']/1e3:.1f}K"
+    lines = ["\\rowcolor{oursbg} \\textbf{ViPER} & $" + G + "{\\text{wav.}}$ & \\checkmark & \\textbf{" + p(OURS) + "} & "
+             + " & ".join(f"\\textbf{{{c}}}" if c != "--" else c for c in cells(OURS)) + " \\\\"]
+    for r in rows:
+        if r[0] == "block":
+            lines.append(f"\\midrule\n\\multicolumn{{{ncol}}}{{l}}{{\\textit{{{r[1]}}}}} \\\\")
+        elif r[0] in runs:
+            a, name, g, vp = r
+            lines.append(f"{name} & {g} & {vp} & {p(a)} & " + " & ".join(cells(a)) + " \\\\")
+    ours3 = mean_std([v for s_, v in seed_values(runs[OURS]).items() if s_ < N_SEEDS])[0]
+    ours2 = mean_std([v for s_, v in seed_values(runs[OURS]).items() if s_ < 2])[0]
+    ctl = seed_values(runs["abl_no_gates"])
+    ctl3 = mean_std([v for s_, v in ctl.items() if s_ < N_SEEDS])[0]
+    ctl5 = mean_std(list(ctl.values()))[0]
+    xcols = ">{\\raggedright\\arraybackslash}X c c r r " + "c" * len(res_cols)
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{ViPER's design space}} (ImageNet-100, DeiT-S, top-1). Each row is ViPER with the band gain ${G}{{g_b(i)}}$ of \\cref{{eq:viper}} and the value path (VP) as shown;
+$g_b(i){{=}}1$ gives RoPE-Mixed, with VP ViPER w/o gates (RoPE-Mixed\\,+\\,LePE). wav.: wavelet energies; static: learned constants $w_b$; RGB: learned $16{{\\times}}16$ patch filter;
+dyadic: periods 2--32 patches instead of the $\\theta$ grid. ViPER, gate sources: seeds 0--4 (seeds 0--2 as in \\cref{{tab:main}}: ViPER {ours3:.2f}, w/o gates {ctl3:.2f}). No SD: seeds 0--1 (values in the supplementary material; ViPER on them: {ours2:.2f}).
+$\\Delta$: paired change vs.\\ ViPER at $224^2$ (superscript: seeds); $^*$: paired $t$-test $p{{<}}0.05$ (${{\\geq}}3$ seeds).}}
+\\label{{tab:ablation}}
+\\setlength{{\\tabcolsep}}{{2pt}}\\footnotesize
+{{%
+\\begin{{tabularx}}{{\\columnwidth}}{{{xcols}}}
+\\toprule
+Variant & ${G}{{g_b(i)}}$ & VP & Params & $\\Delta$ & 224$^2$ & 160$^2$ & 384$^2$ \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabularx}}}}
+\\end{{table}}
+"""
+    write("tab_ablation.tex", tex)
+    return "draft"
+
+
+def table_interp(group="in100_deit_small", res_cols=(128, 288, 384, 448)):
+    """Rotary encodings: positions in patch units of the test grid (extrapolation) vs. rescaled to the training
+    grid (interpolation). One row per method; best per column in bold, second underlined."""
+    runs = load_group(os.path.join(RES, group))
+    rot = [m for m in ("rope_axial", "rope_mixed", "liere", "comrope_ld", "string_cayley", "spiral", OURS) if m in runs]
+    if not rot:
+        return "no rotary runs"
+    cols = []
+    for mode in ("extrapolate", "interpolate"):
+        for r in res_cols:
+            cells = []
+            for m in rot:
+                v = list(seed_values(runs[m], "top1", r, mode).values())
+                cells.append((f"{np.mean(v):.2f}", float(np.mean(v))) if v else ("--", np.nan))
+            cols.append(rank_marks(cells))
+    lines = []
+    for i, m in enumerate(rot):
+        if m == OURS:
+            lines.append("\\midrule")
+            if "abl_no_gates" in runs:                                  # matched control (hybrid reference, not ranked)
+                cc = []
+                for mode in ("extrapolate", "interpolate"):
+                    for r in res_cols:
+                        v = list(seed_values(runs["abl_no_gates"], "top1", r, mode).values())
+                        cc.append(f"\\textcolor{{darkgray}}{{{np.mean(v):.2f}}}" if v else "--")
+                lines.append("\\textcolor{darkgray}{ViPER w/o gates} & " + " & ".join(cc) + " \\\\")
+        lines.append(("\\rowcolor{oursbg} \\textbf{ViPER (ours)}" if m == OURS else name_cell(m)) + " & "
+                     + " & ".join(c[i] for c in cols) + " \\\\")
+    n = len(res_cols)
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Extrapolation vs.\\ interpolation}} (DeiT-S trained at $224^2$, test top-1). \\emph{{Extrap.}}: test-grid
+positions; \\emph{{interp.}}: rescaled to the training grid (same for ComRoPE-LD). Gray: matched control, not ranked.}}
+\\label{{tab:interp}}
+\\setlength{{\\tabcolsep}}{{2.5pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l {'c' * n} {'c' * n}}}
+\\toprule
+& \\multicolumn{{{n}}}{{c}}{{Extrapolation}} & \\multicolumn{{{n}}}{{c}}{{Interpolation}} \\\\
+\\cmidrule(lr){{2-{n + 1}}} \\cmidrule(lr){{{n + 2}-{2 * n + 1}}}
+Method & {' & '.join(str(r) for r in res_cols)} & {' & '.join(str(r) for r in res_cols)} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_interp.tex", tex)
+    return f"{len(rot)} rotary methods"
+
+DOMAINS = [("eurosat", "EuroSAT"), ("resisc45", "RESISC45"), ("bloodmnist", "Blood"), ("dermamnist", "Derma"),
+           ("pathmnist", "Path"), ("tissuemnist", "Tissue"), ("dtd", "DTD"), ("flowers102", "Flowers"),
+           ("fgvc_aircraft", "Aircraft")]
+
+
+def table_domain(group="domain_deit_tiny", key="top1", tag="acc"):
+    base = os.path.join(RES, group)
+    data = {ds: load_group(os.path.join(base, ds)) for ds, _ in DOMAINS}
+    methods = ordered(sorted({m for d in data.values() for m in d if m in PE_INFO}))
+    if not methods:
+        return "no domain runs"
+    cells = {m: [] for m in methods}
+    means = {m: [] for m in methods}
+    for ds, _ in DOMAINS:
+        col = [fmt(seed_values(data[ds].get(m, {}), key), std=False) for m in methods]
+        for m, c in zip(methods, rank_marks(col)):
+            cells[m].append(c)
+        for m, (_, v) in zip(methods, col):
+            means[m].append(v)
+    # average rank and mean over datasets where every method has a value
+    full = [i for i in range(len(DOMAINS)) if all(means[m][i] == means[m][i] for m in methods)]
+    avg = {m: (np.mean([means[m][i] for i in full]) if full else np.nan) for m in methods}
+    ranks = {m: [] for m in methods}
+    for i in full:
+        order = sorted(methods, key=lambda m: -means[m][i])
+        for r, m in enumerate(order, 1):
+            ranks[m].append(r)
+    avg_cells = rank_marks([(f"{avg[m]:.2f}" if avg[m] == avg[m] else "--", avg[m]) for m in methods])
+    rank_cells = rank_marks([(f"{np.mean(ranks[m]):.1f}" if ranks[m] else "--",
+                              -np.mean(ranks[m]) if ranks[m] else np.nan) for m in methods])
+    lines = []
+    for m, a, rk in zip(methods, avg_cells, rank_cells):
+        row = f"{name_cell(m)} & " + " & ".join(cells[m]) + f" & {a} & {rk} \\\\"
+        lines.append(("\\rowcolor{oursbg} " if m == OURS else "") + row)
+    metric_name = "top-1 accuracy" if key == "top1" else "macro-F1"
+    tex = f"""\\begin{{table*}}[t]
+\\centering
+\\caption{{\\textbf{{Nine domain datasets}} (DeiT-Ti from scratch, 100 epochs): {metric_name}, mean over
+{N_SEEDS} seeds (std in the supplement). Avg.: mean over datasets; Rank: mean rank (lower is better).}}
+\\label{{tab:domain_{tag}}}
+\\setlength{{\\tabcolsep}}{{3pt}}
+\\resizebox{{\\textwidth}}{{!}}{{%
+\\begin{{tabular}}{{l {'c' * len(DOMAINS)} cc}}
+\\toprule
+Method & {' & '.join(n for _, n in DOMAINS)} & Avg. & Rank \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table*}}
+"""
+    write(f"tab_domain_{tag}.tex", tex)
+    return f"{len(methods)} methods × {len(full)} complete datasets"
+
+
+def _gflops_viper():
+    r = json.load(open(os.path.join(RES, "efficiency_deit_small.json")))["results"]
+    return r["viper"]["gflops"]
+
+
+def table_gatefreeze():
+    """Test-time gate interventions on trained ViPER (scripts/analysis.py gatefreeze)."""
+    gf = os.path.join(RES, "analysis", "gatefreeze.json")
+    if not os.path.exists(gf):
+        return "no gatefreeze"
+    F = json.load(open(gf))
+    seeds = sorted(F, key=int)
+    rows = [("full", "trained gates"), ("img_mean", "per-image mean over tokens"),
+            ("shuffle", "tokens shuffled within the image"), ("data_mean", "dataset mean per layer, head, band"),
+            ("ones", "all gates $=1$")]
+    lines = []
+    for v, lab in rows:
+        vals = [F[s_][v] for s_ in seeds]
+        d = np.mean(vals) - np.mean([F[s_]["full"] for s_ in seeds])
+        dtxt = "--" if v == "full" else f"{d:+.2f}"
+        lines.append(f"{lab} & " + " & ".join(f"{x:.2f}" for x in vals) + f" & {np.mean(vals):.2f} & {dtxt} \\\\")
+    tex = f"""\\begin{{table}}[t]
+\\centering\\small
+\\caption{{\\textbf{{Test-time gate interventions}} on the trained ViPER models (ImageNet-100 test, $224^2$, top-1).
+The gates are replaced before attention; the network is not retrained. The dataset mean is taken over 2{{,}}000
+validation-holdout images.}}
+\\label{{tab:gatefreeze}}
+\\setlength{{\\tabcolsep}}{{3pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l {"c" * len(seeds)} cc}}
+\\toprule
+Gates & {" & ".join("s" + s_ for s_ in seeds)} & mean & $\\Delta$ \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_gatefreeze.tex", tex)
+    return "ok"
+
+
+def table_efficiency(path="efficiency_deit_small.json", group="in100_deit_small", subset=None, fname="tab_efficiency.tex",
+                     label="tab:efficiency"):
+    """Cost of every PE (one idle GPU) next to its ImageNet-100 accuracy, so the trade-off is visible."""
+    f = os.path.join(RES, path)
+    if not os.path.exists(f):
+        return "no efficiency results"
+    e = json.load(open(f))
+    r = e["results"]
+    runs = load_group(os.path.join(RES, group))
+    methods = ordered([m for m in PE_INFO if m in r and (subset is None or m in subset)])
+    if (subset is None or "abl_no_gates" in subset) and "abl_no_gates" in r and OURS in methods:   # matched control
+        methods.insert(methods.index(OURS), "abl_no_gates")
+    ref = r.get("none", {}).get("infer_img_s")
+    full = subset is None
+    lines = []
+    fam_prev = None
+    for m in methods:
+        fam = PE_INFO[OURS if m == "abl_no_gates" else m][1]
+        if fam_prev is not None and fam != fam_prev and full:      # main table: no rules between rows
+            lines.append("\\midrule")
+        fam_prev = fam
+        x = r[m]
+        acc = fmt(seed_values(runs[m]), std=False)[0] if m in runs else "--"
+        nm = "ViPER w/o gates" if m == "abl_no_gates" else name_cell(m)
+        rel = f"{100 * x['infer_img_s'] / ref:.0f}\\% & " if full else ""
+        row = (f"{nm} & {x['pe_params']/1e3:.1f}K & {x['gflops']:.2f} & {x['infer_img_s']:,.0f} & "
+               f"{rel}{x['train_img_s']:,.0f} & {x['peak_mem_gb']:.1f} & {acc} \\\\")
+        lines.append(("\\rowcolor{oursbg} " if m == OURS else "") + row)
+    gpu = e['gpu'].replace('NVIDIA ', '')
+    if subset is None:
+        cap = (f"\\textbf{{Cost and accuracy}} of every PE on DeiT-S at {e['img']}$^2$, batch {e['bs']}, one idle {gpu} "
+               "(bf16, median of 5 timed passes). Rel.: inference throughput relative to no PE. Train: images per second "
+               "for a full training step (forward, backward, AdamW). Mem: peak training memory. Top-1: ImageNet-100 test "
+               "accuracy (\\cref{M-tab:main}). CARoPE (2D port) was not timed.")
+    else:
+        cap = (f"\\textbf{{Cost}} on DeiT-S at {e['img']}$^2$ (batch {e['bs']}, one {gpu}, bf16). Infer / Train: "
+               "images/s at inference / per training step; Mem: peak training memory.")
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{{cap}}}
+\\label{{{label}}}
+\\setlength{{\\tabcolsep}}{{{"2.5pt" if full else "3pt"}}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l r c r {"r " if full else ""}r c c}}
+\\toprule
+Method & PE params & GFLOPs & {"Infer img/s & Rel." if full else "Infer"} & Train{" img/s" if full else ""} & Mem (GB) & Top-1 \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write(fname, tex)
+    return f"{len(methods)} methods"
+
+
+def table_significance(group="in100_deit_small"):
+    gdir = os.path.join(RES, group)
+    runs = load_group(gdir)
+    if OURS not in runs:
+        return "no ViPER runs yet"
+    ours_seeds = sorted(runs[OURS])
+
+    def pooled(m, seeds):
+        cs = [correctness(os.path.join(gdir, f"{m}_s{s}")) for s in seeds
+              if os.path.exists(os.path.join(gdir, f"{m}_s{s}", "preds.npz"))]
+        return np.stack(cs) if cs else None
+
+    rows, pt, pm = [], {}, {}
+    for m in ordered([x for x in PE_INFO if x in runs and x != OURS]):
+        seeds = sorted(set(ours_seeds) & set(runs[m]))
+        a, b = pooled(OURS, seeds), pooled(m, seeds)
+        sd = paired_seed_test(seed_values(runs[OURS]), seed_values(runs[m]))
+        if a is None or b is None or a.shape != b.shape:
+            rows.append((m, sd, None, None, None)); pt[m] = sd["t_p"]; continue
+        diff, ci, pb = paired_bootstrap(a.mean(0), b.mean(0))
+        pmn = mcnemar(a.reshape(-1), b.reshape(-1))
+        rows.append((m, sd, (diff, ci), pb, pmn)); pt[m] = sd["t_p"]; pm[m] = pmn
+    ht, hm = holm(pt), holm(pm)
+    lines = []
+    for m, sd, boot, pb, pmn in rows:
+        d = f"{sd['diff']:+.2f}" if sd["diff"] == sd["diff"] else "--"
+        ci = f"[{boot[1][0]:+.2f}, {boot[1][1]:+.2f}]" if boot else "--"
+        f = lambda p: "--" if p is None or p != p else ("$<$0.001" if p < 1e-3 else f"{p:.3f}")
+        lines.append(f"{name_cell(m)} & {sd['n']} & {d} & {ci} & {f(ht.get(m))} & {f(hm.get(m))} \\\\")
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Significance of ViPER vs.\\ each baseline}} (ImageNet-100 top-1 at 224). $\\Delta$: mean
+paired difference over seeds; 95\\% CI: paired bootstrap over test images of seed-averaged correctness;
+$p_t$: paired $t$-test over seeds; $p_{{\\mathrm{{McN}}}}$: exact McNemar on seed-pooled predictions; both
+Holm-corrected over the table.}}
+\\label{{tab:significance}}
+\\setlength{{\\tabcolsep}}{{3pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l c r c c c}}
+\\toprule
+Baseline & Seeds & $\\Delta$ top-1 & 95\\% CI & $p_t$ & $p_{{\\mathrm{{McN}}}}$ \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_significance.tex", tex)
+    return f"{len(rows)} comparisons"
+
+
+PILOT_ROWS = [  # (run name in results/pilot_in100_30ep, label, grid, learnable freqs, gates)
+    ("rope_axial", "RoPE-Axial~\\cite{heo2024rope}", "$\\theta$", "", ""),
+    ("rope_mixed", "RoPE-Mixed~\\cite{heo2024rope}", "$\\theta$", "\\checkmark", ""),
+    ("viper_nogate", "dyadic multi-band RoPE", "dyadic", "", ""),
+    ("viper", "ViPER, dyadic grid", "dyadic", "", "\\checkmark"),
+    ("viper_theta", "ViPER, $\\theta$ grid", "$\\theta$", "", "\\checkmark"),
+    ("viper_theta_mixed", "\\textbf{ViPER} ($\\theta$ grid, mixed)", "$\\theta$", "\\checkmark", "\\checkmark"),
+    ("viper_tm_gatek", "\\quad gates on $q$ and $k$", "$\\theta$", "\\checkmark", "$q,k$"),
+    ("viper_tm_bands8", "\\quad $B{=}8$ bands", "$\\theta$", "\\checkmark", "\\checkmark"),
+]
+
+
+def table_pilot(group="pilot_in100_30ep", res_cols=(320, 384, 448)):
+    """Frequency-grid diagnostic (30-epoch pilots, used for design selection on val)."""
+    runs = load_group(os.path.join(RES, group))
+    rows = [r for r in PILOT_ROWS if r[0] in runs]
+    if not rows:
+        return "no pilot runs"
+    cols = [("val", None), ("top1", None)] + [("top1", r) for r in res_cols]
+
+    def vals(m, k, r):
+        if k == "val":
+            return {s: v["best_val_top1"] for s, v in runs[m].items()}
+        return seed_values(runs[m], k, r)
+    cells = {m: [fmt(vals(m, k, r), std=False) for k, r in cols] for m, *_ in rows}
+    marked = {m: [] for m, *_ in rows}
+    for ci in range(len(cols)):
+        for (m, *_), c in zip(rows, rank_marks([cells[m][ci] for m, *_ in rows])):
+            marked[m].append(c)
+    body = "\n".join(f"{lab} & {g} & {mx} & {gt} & " + " & ".join(marked[m]) + " \\\\"
+                     for m, lab, g, mx, gt in rows)
+    seeds = sorted({s for m, *_ in rows for s in runs[m]})
+    tex = ("\\begin{table}[t]\\centering\\small\\setlength{\\tabcolsep}{3pt}\n"
+           "\\caption{\\textbf{The frequency grid decides resolution robustness.} 30-epoch pilots on ImageNet-100 "
+           f"(DeiT-S, seed{'s' if len(seeds) > 1 else ''} {','.join(map(str, seeds))}; superscript: number of seeds "
+           "when fewer than three). Val = 5\\% train holdout used for design selection; the test columns evaluate "
+           "the 224-trained model at $224^2$ and above without position rescaling. A dyadic grid without long-period "
+           "pairs collapses beyond the training grid, with or without gates.}\n"
+           "\\label{tab:pilot}\n"
+           "\\resizebox{\\columnwidth}{!}{%\n\\begin{tabular}{lccc ccccc}\\toprule\n"
+           "& & learn. & & & \\multicolumn{4}{c}{test top-1 @ resolution} \\\\ \\cmidrule(lr){6-9}\n"
+           "Variant & grid & freqs & gates & val & 224 & " + " & ".join(map(str, res_cols)) + " \\\\\\midrule\n"
+           + body + "\n\\bottomrule\\end{tabular}}\\end{table}\n")
+    write("tab_pilot.tex", tex)
+    return f"{len(rows)} variants"
+
+
+VALUE_ROWS = [  # (run, label, score path, value path)
+    ("rope_mixed", "RoPE-Mixed~\\cite{heo2024rope}", "RoPE-Mixed", "--"),
+    ("viper_theta_mixed", "ViPER", "ViPER", "--"),
+    ("viper_fgate", "\\quad gates from feature wavelets", "ViPER$_{\\text{feat}}$", "--"),
+    ("lepe", "LePE~\\cite{dong2022cswin}", "--", "LePE"),
+    ("rope_mixed_lepe", "RoPE-Mixed + LePE", "RoPE-Mixed", "LePE"),
+    ("viper_lepe", "ViPER + LePE", "ViPER", "LePE"),
+    ("rope_mixed_wv", "RoPE-Mixed + WaveLePE", "RoPE-Mixed", "WaveLePE"),
+    ("viper_wv", "ViPER + WaveLePE", "ViPER", "WaveLePE"),
+    ("viper_wvg", "ViPER + gated WaveLePE", "ViPER", "WaveLePE$_g$"),
+    ("viper_wvg1", "ViPER + gated WaveLePE ($J{=}1$)", "ViPER", "WaveLePE$_g$, $J{=}1$"),
+    ("string_cayley", "STRING~\\cite{schenck2025string}", "STRING", "--"),
+]
+
+
+def table_valuepath(group="pilot_in100_30ep", res_cols=(448,)):
+    """Score-path / value-path pilots (30 epochs, design selection on val). Pending rows show '--'."""
+    runs = load_group(os.path.join(RES, group))
+    if not any(r[0] in runs for r in VALUE_ROWS if r[0] not in ("rope_mixed", "viper_theta_mixed")):
+        return "no value-path pilots"
+    cols = [("val", None), ("top1", None)] + [("top1", r) for r in res_cols]
+
+    def vals(m, k, r):
+        if m not in runs:
+            return {}
+        if k == "val":
+            return {s: v["best_val_top1"] for s, v in runs[m].items()}
+        return seed_values(runs[m], k, r)
+    cells = {m: [fmt(vals(m, k, r), std=False) for k, r in cols] for m, *_ in VALUE_ROWS}
+    marked = {m: [] for m, *_ in VALUE_ROWS}
+    for ci in range(len(cols)):
+        for (m, *_), c in zip(VALUE_ROWS, rank_marks([cells[m][ci] for m, *_ in VALUE_ROWS])):
+            marked[m].append(c)
+
+    def params(m):
+        return f"{next(iter(runs[m].values()))['pe_params'] / 1e3:.1f}K" if m in runs else "--"
+    body = "\n".join(f"{lab} & {sp} & {vp} & {params(m)} & " + " & ".join(marked[m]) + " \\\\"
+                     for m, lab, sp, vp in VALUE_ROWS)
+    tex = ("\\begin{table*}[t]\\centering\\small\\setlength{\\tabcolsep}{5pt}\n"
+           "\\caption{\\textbf{Score path and value path.} 30-epoch pilots on ImageNet-100 (DeiT-S; superscripts give "
+           "the number of seeds; --: path not used). The score path encodes relative position in the attention "
+           "logits; the value path adds a local, direction-aware term to the head output. Design choices are made on "
+           "val (5\\% train holdout).}\n"
+           "\\label{tab:valuepath}\n"
+           "\\begin{tabular}{l ll r ccc}\\toprule\n"
+           "Variant & score path & value path & PE params & val & 224 & " + " & ".join(map(str, res_cols))
+           + " \\\\\\midrule\n" + body + "\n\\bottomrule\\end{tabular}\\end{table*}\n")
+    write("tab_valuepath.tex", tex)
+    return "value-path pilots"
+
+
+TWOPATH_ROWS = [  # (group, run, label, score path, value path, matched control (group, run) or None)
+    ("in100_deit_small", "rope_mixed", "RoPE-Mixed~\\cite{heo2024rope}", "RoPE-Mixed", "--", None),
+    ("in100_deit_small", "string_cayley", "STRING~\\cite{schenck2025string}", "STRING", "--", None),
+    ("in100_deit_small", "lepe", "LePE~\\cite{dong2022cswin}", "--", "LePE", None),
+    ("in100_candidates", "viper", "ViPER score path only", "ViPER", "--", ("in100_deit_small", "rope_mixed")),
+    ("in100_deit_small", "abl_no_gates", "ViPER w/o gates", "RoPE-Mixed", "LePE", None),
+    ("in100_deit_small", "viper", "\\textbf{ViPER (ours)}", "ViPER", "LePE", ("in100_deit_small", "abl_no_gates")),
+]
+
+
+def table_twopath(res_cols=(160, 448)):
+    """Score path x value path at 100 epochs (test). Delta: candidate minus its matched control (same value
+    path, no wavelet gates), paired over the seeds both have."""
+    groups = {g: load_group(os.path.join(RES, g), five=True) for g in {r[0] for r in TWOPATH_ROWS}}
+    cand = groups["in100_candidates"]
+    if not any(r[1] in cand for r in TWOPATH_ROWS if r[0] == "in100_candidates"):
+        return "no candidate runs"
+    lines = []
+    for g, run, label, sp, vp, ctrl in TWOPATH_ROWS:
+        rs = groups[g].get(run)
+        if run == "abl_no_gates":
+            lines.append("\\midrule")
+        cells = [fmt(seed_values(rs, "top1", r))[0] if rs else "--" for r in (None,) + tuple(res_cols)]
+        deltas = []
+        for r in (None,) + tuple(res_cols):
+            delta = "--"
+            if rs and ctrl and ctrl[1] in groups[ctrl[0]]:
+                a, b = seed_values(rs, "top1", r), seed_values(groups[ctrl[0]][ctrl[1]], "top1", r)
+                sh = sorted(set(a) & set(b))
+                if sh:
+                    d = np.mean([a[x] - b[x] for x in sh])
+                    p = paired_seed_test(a, b)["t_p"]
+                    star = "$^{*}$" if p == p and p < 0.05 and len(sh) >= 3 else ""
+                    delta = f"{d:+.2f}{star}" + (f"$^{{{len(sh)}}}$" if len(sh) < N_SEEDS else "")
+            deltas.append(delta)
+        row = f"{label} & {sp} & {vp} & " + " & ".join(cells) + " & " + " & ".join(deltas) + " \\\\"
+        if sp.startswith("ViPER") and vp == "LePE":
+            row = "\\rowcolor{oursbg} " + row
+        lines.append(row)
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Two paths.}} Score path $\\times$ value path on ImageNet-100 (DeiT-S, 100 epochs, test top-1;
+superscripts: number of seeds when fewer than {N_SEEDS}). $\\Delta$: gain of the wavelet gates over the matched
+control with the same value path and no gates, paired over shared seeds ($^*$: paired $t$-test $p{{<}}0.05$).}}
+\\label{{tab:twopath}}
+\\setlength{{\\tabcolsep}}{{3pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{lll {'c' * (1 + len(res_cols))} {'c' * (1 + len(res_cols))}}}
+\\toprule
+ & & & \\multicolumn{{{1 + len(res_cols)}}}{{c}}{{Test top-1}} & \\multicolumn{{{1 + len(res_cols)}}}{{c}}{{$\\Delta$ gates}} \\\\
+\\cmidrule(lr){{4-{4 + len(res_cols)}}}\\cmidrule(lr){{{5 + len(res_cols)}-{5 + 2 * len(res_cols)}}}
+Model & Score path & Value path & @224 & {' & '.join(f'@{r}' for r in res_cols)} & @224 & {' & '.join(f'@{r}' for r in res_cols)} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_twopath.tex", tex)
+    return f"{sum(1 for r in TWOPATH_ROWS if r[1] in groups[r[0]])} rows"
+
+
+ADE_ROWS = ["rope_mixed", "string_cayley", "lepe", "lookhere", "abl_no_gates", "viper"]
+
+
+ADE_EXTRA = ["macc", "mdice"]           # extra columns, shown only when every run has them
+ADE_HEAD = {"miou": "mIoU", "aacc": "aAcc", "macc": "mAcc", "mdice": "mDice"}
+
+
+def load_ade(group="ade20k_deit_small"):
+    out = defaultdict(dict)
+    for f in glob.glob(os.path.join(RES, group, "*", "final.json")):
+        m, sd = os.path.basename(os.path.dirname(f)).rsplit("_s", 1)
+        v = json.load(open(f))["val"]
+        out[m][int(sd)] = {"miou": v["miou"], "aacc": v["aacc"], "iou": v.get("iou")}
+        ex = os.path.join(os.path.dirname(f), "extra_metrics.json")     # scripts/seg_reeval.py
+        if os.path.exists(ex):
+            out[m][int(sd)].update({k: x for k, x in json.load(open(ex)).items() if k in ADE_EXTRA})
+    return out
+
+
+def table_ade20k(full=False):
+    """ADE20K semantic segmentation, fine-tuned from the ImageNet-100 checkpoint of the same seed.
+    Main paper: baselines and ViPER; supplement (full=True): also ViPER w/o gates."""
+    runs = load_ade()
+    rows = [m for m in ADE_ROWS if m in runs and (full or m != "abl_no_gates")]
+    if not rows:
+        return "no ADE20K runs"
+    label = {"abl_no_gates": "ViPER w/o gates", "viper": "\\textbf{ViPER (ours)}"}
+    keys = ["miou", "aacc"] + [k for k in ADE_EXTRA if all(k in r for m in rows for r in runs[m].values())]
+    cells = {m: [fmt({sd: r[k] for sd, r in runs[m].items()}) for k in keys] for m in rows}
+    marked = {m: [] for m in rows}
+    for ci in range(len(keys)):
+        col = rank_marks([cells[m][ci] for m in rows])
+        for m, c in zip(rows, col):
+            marked[m].append(c)
+    lines = []
+    for m in rows:
+        row = f"{label.get(m, name_cell(m))} & " + " & ".join(marked[m]) + " \\\\"
+        if m == OURS:
+            lines.append("\\midrule")
+        lines.append(("\\rowcolor{oursbg} " if m == "viper" else "") + row)
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Semantic segmentation on ADE20K}} (val, single scale). ImageNet-100 DeiT-S backbones fine-tuned at
+$512^2$ with a linear decoder for 20k iterations; mean{{\\scriptsize$\\pm$std}} over 3 seeds. mAcc / mDice: mean per-class
+accuracy / Dice (F1).{" With the matched control (ViPER w/o gates)." if full else ""}}}
+\\label{{tab:ade20k{"_full" if full else ""}}}
+\\setlength{{\\tabcolsep}}{{4pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l {"c" * len(keys)}}}
+\\toprule
+Backbone PE & {" & ".join(ADE_HEAD[k] for k in keys)} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_ade20k_full.tex" if full else "tab_ade20k.tex", tex)
+    return f"{len(rows)} methods, seeds: " + ", ".join(f"{m}={len(runs[m])}" for m in rows)
+
+IN1K_ROWS = ["none", "learned", "rope_mixed", "string_cayley", "lepe", "lookhere", "viper"]
+IN1K_COLS = [("top1", None, "Top-1"), ("macro_f1", None, "Macro-F1"),        # top-5 dropped (no separation)
+             ("top1", 160, "160"), ("top1", 288, "288"), ("top1", 384, "384")]
+
+
+def load_in1k(group="in1k_deit_small"):
+    """ImageNet-1k runs with ViPER = the gate-learning-rate fix (viper_glr, adopted by the pre-registered validation
+    rule); the original ViPER runs are kept as 'viper_orig' (supplement disclosure)."""
+    gdir = os.path.join(RES, group)
+    runs = dict(load_group(gdir)) if os.path.isdir(gdir) else {}
+    if "viper_glr" in runs:
+        runs["viper_orig"] = runs.get("viper", {})
+        runs["viper"] = runs.pop("viper_glr")
+    return runs
+
+
+def table_in1k(group="in1k_deit_small"):
+    """ImageNet-1k, DeiT-S, 100 epochs, one seed. Runs that have not finished show '--' and fill in on re-run."""
+    runs = load_in1k(group)
+    n_max = max([len(runs[m]) for m in IN1K_ROWS if m in runs] or [1])
+    seed_txt = ("one seed" if n_max == 1 else
+                f"mean over {n_max} seeds, 224 columns as mean" + "{\\scriptsize$\\pm$std}; superscript: fewer seeds")
+    cells = {m: [fmt(seed_values(runs[m], k, r), std=(ci <= 1)) if m in runs else ("--", np.nan)   # +-std: top-1, F1
+                 for ci, (k, r, _) in enumerate(IN1K_COLS)] for m in IN1K_ROWS}
+    cells = {m: [(t, round(v, 2) if v == v else v) for t, v in c] for m, c in cells.items()}   # ties at 2 decimals share the mark
+    marked = {m: [] for m in IN1K_ROWS}
+    for ci in range(len(IN1K_COLS)):
+        for m, c in zip(IN1K_ROWS, rank_marks([cells[m][ci] for m in IN1K_ROWS])):
+            marked[m].append(c.replace("$^{1}$", "") if n_max == 1 else c)
+    lines = []
+    for m in IN1K_ROWS:
+        if m in (OURS, "rope_mixed"):
+            lines.append("\\midrule")
+        if SHOW_CONTROL_MAIN and m == OURS and "abl_no_gates" in runs:   # matched control, not ranked
+            ctl = [fmt(seed_values(runs["abl_no_gates"], k, r), std=(ci <= 1))[0] for ci, (k, r, _) in enumerate(IN1K_COLS)]
+            lines.append("\\textcolor{darkgray}{ViPER w/o gates} & " + " & ".join(f"\\textcolor{{darkgray}}{{{c}}}" for c in ctl) + " \\\\")
+        lines.append(("\\rowcolor{oursbg} " if m == OURS else "") + f"{name_cell(m)} & " + " & ".join(marked[m]) + " \\\\")
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{ImageNet-1k}} (DeiT-S, 100 epochs, {seed_txt}; official validation set as test). Right: other test
+resolutions, no fine-tuning.{" ViPER w/o gates (gray): matched control, not ranked." if SHOW_CONTROL_MAIN else ""}}}
+\\label{{tab:in1k}}
+\\setlength{{\\tabcolsep}}{{4pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l cc ccc}}
+\\toprule
+& \\multicolumn{{2}}{{c}}{{Test at 224}} & \\multicolumn{{3}}{{c}}{{Top-1 at test resolution}} \\\\
+\\cmidrule(lr){{2-3}}\\cmidrule(lr){{4-6}}
+Method & {" & ".join(h for _, _, h in IN1K_COLS)} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_in1k.tex", tex)
+    lost = [h for ci, (_, _, h) in enumerate(IN1K_COLS)                        # columns where ViPER is not best
+            if OURS in runs and any(cells[m][ci][1] > cells[OURS][ci][1] for m in IN1K_ROWS
+                                    if m != OURS and cells[m][ci][1] == cells[m][ci][1])]
+    lab = {"160": "$160^2$", "288": "$288^2$", "384": "$384^2$"}
+    txt = ("in every column" if not lost else
+           "in every column except " + ", ".join(lab.get(h, h) for h in lost))
+    write("in1k_bestcols.tex", "\\def\\inonekbestcols{" + txt + "}\n")
+    return "finished: " + ", ".join(m for m in IN1K_ROWS if m in runs)
+
+
+SCALE_COLS = [("in100_deit_tiny", "DeiT-Ti"), ("in100_deit_small", "DeiT-S"), ("in100_deit_base", "DeiT-B"),
+              ("transfer/flowers102", "Flowers"), ("transfer/fgvc_aircraft", "Aircraft"), ("transfer/dtd", "DTD")]
+# EuroSAT (saturated, 98.6-98.9% for every encoding) was dropped from the paper; its runs stay in results/
+SCALE_ROWS = ["rope_mixed", "string_cayley", "lepe", "lookhere", "abl_no_gates", "viper"]
+
+
+def table_scale(full=False):
+    """Other backbones (ImageNet-100, from scratch) and transfer (DeiT-S ImageNet-100 checkpoint of seed s,
+    fine-tuned on each dataset with seed s). Mean test top-1; seeds as superscript when fewer than three."""
+    data = {g: load_group(os.path.join(RES, g)) for g, _ in SCALE_COLS}
+    rows = [m for m in SCALE_ROWS if any(m in d for d in data.values())]
+    from stats import seed_values
+    in_cols = [(g, n) for g, n in SCALE_COLS if g.startswith("in100_")]
+    tr_cols = [(g, n) for g, n in SCALE_COLS if not g.startswith("in100_")]
+    specs = [(g, n, None) for g, n in in_cols] + [(g, n, 160) for g, n in in_cols] + \
+        ([(g, n, None) for g, n in tr_cols] if full else [])
+    cols = []
+    for g, _, res in specs:
+        cells = []
+        for m in rows:
+            rs = data[g].get(m, {})
+            v = ([r["test"]["top1"] for r in rs.values()] if res is None
+                 else list(seed_values(rs, "top1", res).values()))
+            if not v:
+                cells.append(("--", np.nan))
+                continue
+            sd = "{\\scriptsize$\\pm$%.2f}" % np.std(v, ddof=1) if full and len(v) > 1 else ""
+            txt = f"{np.mean(v):.2f}" + sd + (f"$^{{{len(v)}}}$" if len(v) < 3 else "")
+            cells.append((txt, float(np.mean(v))))
+        cols.append(rank_marks(cells))
+    label = {"abl_no_gates": "ViPER w/o gates", "viper": "\\textbf{ViPER (ours)}"}
+    lines = []
+    for i, m in enumerate(rows):
+        if m == OURS:
+            lines.append("\\midrule")
+        lines.append(("\\rowcolor{oursbg} " if m == "viper" else "") + label.get(m, PE_INFO.get(m, (m,))[0]) + " & "
+                     + " & ".join(c[i] for c in cols) + " \\\\")
+    env = "table*" if full else "table"
+    ttl, lab = (" (mean$\\pm$std)", "_full") if full else ("", "")
+    sep, size = ("5pt", "\\small") if full else ("5pt", "\\small")
+    rb_open, rb_close = ("\\resizebox{\\textwidth}{!}{%", "}") if full else ("\\resizebox{\\columnwidth}{!}{%", "}")
+    cap = ("\\textbf{Other backbones and transfer}, mean$\\pm$std (test top-1, seeds 0--2, DeiT-S as in \\cref{M-tab:main}; superscript: fewer seeds). "
+           "Left: trained from scratch on ImageNet-100, tested at $224^2$ and $160^2$ (more in \\cref{tab:scale_res}). "
+           "Right: DeiT-S ImageNet-100 models fine-tuned for 100 epochs." if full else
+           "\\textbf{Other backbones} (ImageNet-100 from scratch, test top-1, seeds 0--2; DeiT-B: one seed; DeiT-S as in \\cref{tab:main}; superscript: fewer seeds), "
+           "tested at $224^2$ and $160^2$.")
+    tr_spec = (" " + "c" * len(tr_cols)) if full else ""
+    tr_head = (" & \\multicolumn{%d}{c}{Transfer from DeiT-S}" % len(tr_cols)) if full else ""
+    tr_rule = (" \\cmidrule(lr){8-%d}" % (7 + len(tr_cols))) if full else ""
+    tex = f"""\\begin{{{env}}}[t]
+\\centering
+\\caption{{{cap}}}
+\\label{{tab:scale{lab}}}
+\\setlength{{\\tabcolsep}}{{{sep}}}
+{size}
+{rb_open}
+\\begin{{tabular}}{{l ccc ccc{tr_spec}}}
+\\toprule
+& \\multicolumn{{3}}{{c}}{{$224^2$}} & \\multicolumn{{3}}{{c}}{{$160^2$}}{tr_head} \\\\
+\\cmidrule(lr){{2-4}} \\cmidrule(lr){{5-7}}{tr_rule}
+PE & {" & ".join(n for _, n, _ in specs)} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}{rb_close}
+\\end{{{env}}}
+"""
+    write("tab_scale_full.tex" if full else "tab_scale.tex", tex)
+    return ", ".join(f"{n}: " + "/".join(str(len(data[g].get(m, {}))) for m in rows) for g, n in SCALE_COLS)
+
+
+TRANSFER = [("transfer/flowers102", "Flowers-102"), ("transfer/fgvc_aircraft", "FGVC-Aircraft"), ("transfer/dtd", "DTD")]
+# EuroSAT is saturated (all encodings 98.6-98.9%); dropped from the paper, its runs stay in results/
+
+
+def table_transfer():
+    """Transfer: DeiT-S ImageNet-100 model of seed s fine-tuned on each dataset with seed s; top-1 and macro-F1,
+    plus the average over the three datasets."""
+    data = {g: (load_group(os.path.join(RES, g)) if os.path.isdir(os.path.join(RES, g)) else {}) for g, _ in TRANSFER}
+    rows = [m for m in SCALE_ROWS if all(m in data[g] for g, _ in TRANSFER[:3])]
+    done = [g for g, _ in TRANSFER if all(m in data[g] for m in rows)]      # average only over finished datasets
+    specs = [(g, k) for g, _ in TRANSFER for k in ("top1", "macro_f1")]
+    cols = []
+    for g, k in specs:
+        cells = []
+        for m in rows:
+            if g == "avg":
+                v = np.mean([np.mean([r["test"][k] for r in data[gg][m].values()]) for gg in done])
+            elif m not in data[g]:
+                cells.append(("--", np.nan)); continue
+            else:
+                v = np.mean([r["test"][k] for r in data[g][m].values()])
+            n = 3 if g == "avg" else len(data[g][m])
+            cells.append((f"{v:.2f}" + (f"$^{{{n}}}$" if n < 3 else ""), float(v)))
+        cols.append(rank_marks(cells))
+    label = {"abl_no_gates": "ViPER w/o gates", "viper": "\\textbf{ViPER (ours)}"}
+    lines = []
+    for i, m in enumerate(rows):
+        if m == OURS:
+            lines.append("\\midrule")
+        lines.append(("\\rowcolor{oursbg} " if m == "viper" else "") + label.get(m, PE_INFO.get(m, (m,))[0]) + " & "
+                     + " & ".join(c[i] for c in cols) + " \\\\")
+    heads = " & ".join(f"\\multicolumn{{2}}{{c}}{{{n}}}" for _, n in TRANSFER)
+    rules = " ".join("\\cmidrule(lr){%d-%d}" % (2 + 2 * i, 3 + 2 * i) for i in range(len(TRANSFER)))
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Transfer}}: DeiT-S ImageNet-100 models fine-tuned for 100 epochs (test, mean over 3 seeds; seed $s$ starts
+from the model of seed $s$). F1: macro-F1.}}
+\\label{{tab:transfer}}
+\\setlength{{\\tabcolsep}}{{3pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l {" ".join(["cc"] * len(TRANSFER))}}}
+\\toprule
+& {heads} \\\\
+{rules}
+PE & {" & ".join(["Top-1", "F1"] * len(TRANSFER))} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_transfer.tex", tex)
+    return f"{len(rows)} methods"
+
+
+def table_scale_res():
+    """Supplementary: every backbone at every evaluation resolution (mean test top-1, no fine-tuning)."""
+    from stats import seed_values
+    in_cols = [(g, n) for g, n in SCALE_COLS if g.startswith("in100_")]
+    data = {g: load_group(os.path.join(RES, g)) for g, _ in in_cols}
+    rows = [m for m in SCALE_ROWS if any(m in d for d in data.values())]
+    resl = [128, 160, 224, 448]
+    cols = []
+    for g, _ in in_cols:
+        for res in resl:
+            cells = []
+            for m in rows:
+                rs = data[g].get(m, {})
+                v = list(seed_values(rs, "top1", None if res == 224 else res).values()) if rs else []
+                if res == 224:
+                    v = [r["test"]["top1"] for r in rs.values()]
+                if not v:
+                    cells.append(("--", np.nan)); continue
+                cells.append((f"{np.mean(v):.2f}" + (f"$^{{{len(v)}}}$" if len(v) < 3 else ""), float(np.mean(v))))
+            cols.append(rank_marks(cells))
+    label = {"abl_no_gates": "ViPER w/o gates", "viper": "\\textbf{ViPER (ours)}"}
+    lines = []
+    for i, m in enumerate(rows):
+        if m == OURS:
+            lines.append("\\midrule")
+        lines.append(("\\rowcolor{oursbg} " if m == "viper" else "") + label.get(m, PE_INFO.get(m, (m,))[0]) + " & "
+                     + " & ".join(c[i] for c in cols) + " \\\\")
+    heads = " & ".join(f"\\multicolumn{{4}}{{c}}{{{n}}}" for _, n in in_cols)
+    rules = " ".join(f"\\cmidrule(lr){{{2+4*k}-{5+4*k}}}" for k in range(len(in_cols)))
+    sub = " & ".join(" & ".join(str(r) for r in resl) for _ in in_cols)
+    xcol_spec = " ".join([">{\\centering\\arraybackslash}X" * 4] * len(in_cols))
+    tex = f"""\\begin{{table*}}[t]
+\\centering
+\\caption{{\\textbf{{Other backbones across resolutions.}} Test top-1 (\\%) on ImageNet-100, mean over seeds 0--2 (DeiT-S as in \\cref{{M-tab:main}})
+(superscript: number of seeds when fewer), trained at $224^2$ and evaluated at each resolution without fine-tuning.}}
+\\label{{tab:scale_res}}
+\\setlength{{\\tabcolsep}}{{3pt}}
+\\small
+\\begin{{tabularx}}{{\\textwidth}}{{l {xcol_spec}}}
+\\toprule
+& {heads} \\\\
+{rules}
+PE & {sub} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabularx}}
+\\end{{table*}}
+"""
+    write("tab_scale_res.tex", tex)
+
+
+ROBUST_SETS = [("v2", "IN-v2"), ("sketch", "Sketch"), ("r", "IN-R"), ("a", "IN-A")]
+
+
+def load_robust():
+    """{method: {set: {seed: top1}}} from results/robust, same seed protocol as the main table."""
+    out = defaultdict(lambda: defaultdict(dict))
+    for f in glob.glob(os.path.join(RES, "robust", "*.json")):
+        m, sd = os.path.basename(f)[:-5].rsplit("_s", 1)
+        if int(sd) >= 3:
+            continue
+        if not os.path.exists(os.path.join(RES, "in100_deit_small", f"{m}_s{sd}", "final.json")):
+            continue                                                       # only finished training runs
+        for k, v in json.load(open(f)).items():
+            out[m][k][int(sd)] = v["top1"]
+    return out
+
+
+def table_robust(group="in100_deit_small"):
+    R = load_robust()
+    runs = load_group(os.path.join(RES, group))
+    methods = ordered([m for m in PE_INFO if m in R])
+    if "abl_no_gates" in R and OURS in methods:                                     # matched control next to ViPER
+        methods.insert(methods.index(OURS), "abl_no_gates")
+    if not methods:
+        return "no robustness results"
+    n_img = {}
+    for f in glob.glob(os.path.join(RES, "robust", "*.json")):
+        n_img = {k: (v["n"], v["n_cls"]) for k, v in json.load(open(f)).items()}
+        break
+    cols = []
+    for m in methods:
+        c = [fmt(seed_values(runs[m]), std=False) if m in runs else ("--", np.nan)]
+        c += [fmt(R[m][k], std=False) for k, _ in ROBUST_SETS]
+        avg = {sd: np.mean([R[m][k][sd] for k, _ in ROBUST_SETS]) for sd in R[m]["v2"]
+               if all(sd in R[m][k] for k, _ in ROBUST_SETS)}
+        c.append(fmt(avg, std=False))
+        cols.append(c)
+    marked = [[] for _ in methods]
+    for ci in range(len(cols[0])):
+        col = rank_marks([c[ci] for c in cols])
+        for i, x in enumerate(col):
+            marked[i].append(x)
+    lines, fam_prev = [], None
+    for m, mk in zip(methods, marked):
+        fam = PE_INFO[OURS if m == "abl_no_gates" else m][1]
+        if fam_prev is not None and fam != fam_prev:
+            lines.append("\\midrule")
+        fam_prev = fam
+        lines.append(("\\rowcolor{oursbg} " if m == OURS else "") + f"{name_cell(m)} & " + " & ".join(mk) + " \\\\")
+    sizes = ", ".join(f"{lab} {n_img[k][0]:,} images / {n_img[k][1]} classes" for k, lab in ROBUST_SETS if k in n_img)
+    tex = f"""\\begin{{table*}}[t]
+\\centering
+\\caption{{\\textbf{{Out-of-distribution robustness}} (top-1, 100-way, ImageNet-100 classes only; {sizes}). Models
+trained on ImageNet-100 at $224^2$, evaluated without adaptation; IN-100: in-distribution test set.}}
+\\label{{tab:robust}}
+\\setlength{{\\tabcolsep}}{{3pt}}\\small
+\\begin{{tabularx}}{{0.8\\textwidth}}{{l *{{6}}{{>{{\\centering\\arraybackslash}}X}}}}
+\\toprule
+Method & IN-100 & {" & ".join(lab for _, lab in ROBUST_SETS)} & OOD avg. \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabularx}}
+\\end{{table*}}
+"""
+    write("tab_robust.tex", tex)
+    return f"{len(methods)} methods"
+
+
+IN1K_VIPER = "viper_glr"        # run name shown as ViPER in the ImageNet-1k robustness table ("viper_glr" if adopted)
+
+
+def load_robust_in1k():
+    """{method: {set: {seed: top1}}} from results/robust_in1k (scripts/robust_eval_in1k.py), seeds 0-2."""
+    out = defaultdict(lambda: defaultdict(dict))
+    for f in glob.glob(os.path.join(RES, "robust_in1k", "*.json")):
+        m, sd = os.path.basename(f)[:-5].rsplit("_s", 1)
+        if int(sd) >= N_SEEDS:
+            continue
+        for k, v in json.load(open(f)).items():
+            if k != "avg":
+                out[m][k][int(sd)] = v["top1"]
+    return out
+
+
+def table_robust_in1k(group="in1k_deit_small"):
+    """Shifted test sets for the ImageNet-1k models: v2 and Sketch 1000-way, R and A over their 200 classes."""
+    R = load_robust_in1k()
+    runs = load_group(os.path.join(RES, group))
+    rows = [m for m in IN1K_ROWS if m != OURS] + ["abl_no_gates", OURS]
+    src = {m: (IN1K_VIPER if m == OURS else m) for m in rows}
+    rows = [m for m in rows if src[m] in R]
+    if len(rows) < 3:
+        return "no ImageNet-1k robustness results"
+    cols = []
+    for m in rows:
+        r = R[src[m]]
+        c = [fmt(seed_values(runs[src[m]]), std=False) if src[m] in runs else ("--", np.nan)]
+        c += [fmt(r[k], std=False) for k, _ in ROBUST_SETS]
+        avg = {sd: np.mean([r[k][sd] for k, _ in ROBUST_SETS]) for sd in r["v2"] if all(sd in r[k] for k, _ in ROBUST_SETS)}
+        c.append(fmt(avg, std=False))
+        cols.append([(t, round(v, 2) if v == v else v) for t, v in c])
+    marked = list(zip(*[rank_marks([c[ci] for c in cols]) for ci in range(len(cols[0]))]))
+    lines = []
+    for m, mk in zip(rows, marked):
+        if m in ("rope_mixed", "abl_no_gates"):
+            lines.append("\\midrule")
+        lines.append(("\\rowcolor{oursbg} " if m == OURS else "") + f"{name_cell(m)} & " + " & ".join(mk) + " \\\\")
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{ImageNet-1k robustness}} (DeiT-S trained on ImageNet-1k at $224^2$, top-1, no adaptation).
+IN-v2 and Sketch: 1000-way; IN-R and IN-A: over their 200 classes. IN-1k: in-distribution test set; superscript: fewer seeds.}}
+\\label{{tab:robust_in1k}}
+\\setlength{{\\tabcolsep}}{{3pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l cccccc}}
+\\toprule
+Method & IN-1k & {" & ".join(lab for _, lab in ROBUST_SETS)} & OOD avg. \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_robust_in1k.tex", tex)
+    return f"{len(rows)} methods"
+
+
+def table_resfull(group="in100_deit_small"):
+    """Supplementary: top-1 of every encoding at every test resolution (extrapolation, mean over seeds)."""
+    runs = load_group(os.path.join(RES, group))
+    methods = ordered([m for m in PE_INFO if m in runs])
+    res = sorted({int(r) for m in methods for f in runs[m].values() for r in f.get("multires", {})})
+    cells = {m: [fmt(seed_values(runs[m], "top1", None if r == 224 else r), std=False) for r in res] for m in methods}
+    marked = {m: [] for m in methods}
+    for ci in range(len(res)):
+        col = rank_marks([cells[m][ci] for m in methods])
+        for m, c in zip(methods, col):
+            marked[m].append(c)
+    lines, fam_prev = [], None
+    for m in methods:
+        fam = PE_INFO[m][1]
+        if fam_prev is not None and fam != fam_prev:
+            lines.append("\\midrule")
+        fam_prev = fam
+        lines.append(("\\rowcolor{oursbg} " if m == OURS else "") + f"{name_cell(m)} & " + " & ".join(marked[m]) + " \\\\")
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Top-1 at every test resolution}} (ImageNet-100, DeiT-S trained at $224^2$, positions in patch units of the
+test grid, mean over seeds). Best in \\textbf{{bold}}, second \\underline{{underlined}}.}}
+\\label{{tab:resfull}}
+\\setlength{{\\tabcolsep}}{{2pt}}
+\\resizebox{{\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l {'c' * len(res)}}}
+\\toprule
+Method & {' & '.join(str(r) for r in res)} \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_resfull.tex", tex)
+    return f"{len(methods)} methods x {len(res)} resolutions"
+
+
+def table_calib(group="in100_deit_small", n_bins=15):
+    """Supplementary: calibration on the test set (ECE with 15 equal-width bins, NLL), mean over seeds."""
+    gdir = os.path.join(RES, group)
+    runs = load_group(gdir)
+    methods = ordered([m for m in PE_INFO if m in runs]) + (["abl_no_gates"] if "abl_no_gates" in runs else [])
+    rows = {}
+    for m in methods:
+        ece, nll = {}, {}
+        for sd in runs[m]:
+            f = os.path.join(gdir, f"{m}_s{sd}", "preds.npz")
+            if not os.path.exists(f):
+                continue
+            z = np.load(f)
+            lg = z["test_logits"].astype(np.float64); y = z["test_labels"].astype(np.int64)
+            lg -= lg.max(1, keepdims=True); p_ = np.exp(lg); p_ /= p_.sum(1, keepdims=True)
+            conf, pred = p_.max(1), p_.argmax(1)
+            bins = np.minimum((conf * n_bins).astype(int), n_bins - 1)
+            ece[sd] = 100 * sum(abs((pred[bins == b] == y[bins == b]).mean() - conf[bins == b].mean()) * (bins == b).mean()
+                                for b in range(n_bins) if (bins == b).any())
+            nll[sd] = -np.log(p_[np.arange(len(y)), y] + 1e-12).mean()
+        if ece:
+            rows[m] = (ece, nll, seed_values(runs[m]))
+    lines = []
+    for m, (ece, nll, acc) in rows.items():
+        lab = "ViPER w/o gates (control)" if m == "abl_no_gates" else name_cell(m)
+        line = f"{lab} & {fmt(acc, std=False)[0]} & {fmt(ece)[0]} & {fmt(nll, prec=3)[0]} \\\\"
+        lines.append(("\\rowcolor{oursbg} " if m == OURS else "") + line)
+    tex = f"""\\begin{{table}}[t]
+\\centering
+\\caption{{\\textbf{{Calibration}} on the ImageNet-100 test set: expected calibration error (ECE, {n_bins} bins, \\%) and
+negative log-likelihood (NLL), mean over seeds; no temperature scaling.}}
+\\label{{tab:calib}}
+\\setlength{{\\tabcolsep}}{{5pt}}
+\\footnotesize
+\\resizebox{{0.75\\columnwidth}}{{!}}{{%
+\\begin{{tabular}}{{l ccc}}
+\\toprule
+Method & Top-1 & ECE $\\downarrow$ & NLL $\\downarrow$ \\\\
+\\midrule
+{chr(10).join(lines)}
+\\bottomrule
+\\end{{tabular}}}}
+\\end{{table}}
+"""
+    write("tab_calib.tex", tex)
+    return f"{len(rows)} methods"
+
+
+def write_numbers(groups=("in100_deit_small", "pilot_in100_30ep", "in100_candidates", "in100_deit_tiny",
+                          "in100_deit_base", "transfer/flowers102", "transfer/fgvc_aircraft", "transfer/dtd",
+                          "transfer/eurosat", "in1k_deit_small")):
+    """LaTeX macros for every number quoted in the text: \\R{<group>/<method>}{<field>}, e.g.
+    \\R{main/rope_mixed}{top1}. Fields: top1, std, n, val, r448 (top-1 at 448), d448 (448 minus 224),
+    r128. Generated from results/ like the tables, so the prose never carries hand-typed numbers."""
+    short = {"in100_deit_small": "main", "pilot_in100_30ep": "pilot", "in100_candidates": "cand",
+             "in100_deit_tiny": "tiny", "in100_deit_base": "base", "transfer/flowers102": "flowers",
+             "transfer/fgvc_aircraft": "aircraft", "transfer/dtd": "dtd", "transfer/eurosat": "eurosat", "in1k_deit_small": "in1k"}
+    lines = ["% AUTO-GENERATED by scripts/make_tables.py -- do not edit by hand",
+             "\\makeatletter",
+             "\\providecommand{\\R}[2]{\\@ifundefined{vr@#1@#2}{\\textcolor{red}{??}}{\\csname vr@#1@#2\\endcsname}}"]
+    for g, five in [(g, False) for g in groups] + [("in100_deit_small", True)]:   # gate5/: 5-seed gate comparison
+        runs = load_group(os.path.join(RES, g), five=five) if os.path.isdir(os.path.join(RES, g)) else {}
+        if g == "in1k_deit_small" and not five:
+            runs = load_in1k()
+        if five:
+            runs = {m: rs for m, rs in runs.items() if len(rs) > N_SEEDS}
+        for m, rs in runs.items():
+            t = list(seed_values(rs).values())
+            r448 = list(seed_values(rs, "top1", 448).values())
+            r128 = list(seed_values(rs, "top1", 128).values())
+            r160 = list(seed_values(rs, "top1", 160).values())
+            vals = {"top1": np.mean(t), "std": np.std(t, ddof=1) if len(t) > 1 else 0.0, "n": len(t),
+                    "val": np.mean([r["best_val_top1"] for r in rs.values()])}
+            if "pe_params" in next(iter(rs.values())):
+                vals["params"] = next(iter(rs.values()))["pe_params"] / 1e3
+            if r448:
+                vals["r448"] = np.mean(r448)
+                vals["d448"] = np.mean(r448) - np.mean(t)
+            if r128:
+                vals["r128"] = np.mean(r128)
+            if r160:
+                vals["r160"] = np.mean(r160)
+            for k, v in vals.items():
+                txt = (str(v) if k == "n" else f"{v:+.1f}" if k == "d448" else f"{v:.1f}K" if k == "params"
+                       else f"{v:.2f}")
+                lines.append(f"\\expandafter\\def\\csname vr@{'gate5' if five else short[g]}/{m}@{k}\\endcsname{{{txt}}}")
+    main_g = load_group(os.path.join(RES, "in100_deit_small"), five=True)
+    for tag_, v, c in (("viper_lepe", "viper", "abl_no_gates"), ("static", "viper", "abl_static_gate"),
+                       ("rgb", "viper", "abl_rgb_gate")):    # final ViPER vs its matched control, 5 seeds
+        if v not in main_g or c not in main_g:
+            continue
+        for r in (None, 128, 160, 288, 384, 448):
+            a, b = seed_values(main_g[v], "top1", r), seed_values(main_g[c], "top1", r)
+            sh = sorted(set(a) & set(b))
+            if not sh:
+                continue
+            t = paired_seed_test(a, b)
+            tag = str(r or 224)
+            vals = {f"d{tag}": f"{np.mean([a[x] - b[x] for x in sh]):+.2f}", f"n{tag}": str(len(sh)),
+                    f"pos{tag}": str(sum(a[x] > b[x] for x in sh)), f"p{tag}": f"{t['t_p']:.3f}" if t["t_p"] == t["t_p"] else "--",
+                    f"pt{tag}": ("{<}0.001" if t["t_p"] < 1e-3 else f"{{=}}{t['t_p']:.3f}") if t["t_p"] == t["t_p"] else "{=}--"}
+            for k, val in vals.items():
+                lines.append(f"\\expandafter\\def\\csname vr@pair/{tag_}@{k}\\endcsname{{{val}}}")
+    main3 = load_group(os.path.join(RES, "in100_deit_small"))      # ImageNet-100: gap to the strongest baseline (abstract)
+    base100 = {m: np.mean(list(seed_values(rs).values())) for m, rs in main3.items() if m in PE_INFO and m != OURS}
+    if OURS in main3 and base100:
+        best = max(base100, key=base100.get)
+        gap = np.mean(list(seed_values(main3[OURS]).values())) - base100[best]
+        lines.append(f"\\expandafter\\def\\csname vr@maingap/best@d\\endcsname{{{gap:+.2f}}}")
+        lines.append(f"\\expandafter\\def\\csname vr@maingap/best@name\\endcsname{{{PE_INFO[best][0]}}}")
+    g1k = os.path.join(RES, "in1k_deit_small")                    # ImageNet-1k: ViPER vs each baseline, paired over seeds
+    if os.path.isdir(g1k):
+        r1k = load_in1k()
+        base1k = {m: np.mean(list(seed_values(r1k[m]).values())) for m in IN1K_ROWS if m in r1k and m != OURS}
+        if OURS in r1k and base1k:                                     # gap to the strongest baseline (abstract)
+            best = max(base1k, key=base1k.get)
+            gap = np.mean(list(seed_values(r1k[OURS]).values())) - base1k[best]
+            lines.append(f"\\expandafter\\def\\csname vr@in1kgap/best@d\\endcsname{{{gap:+.2f}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@in1kgap/best@name\\endcsname{{{PE_INFO[best][0]}}}")
+        R1k = load_robust_in1k()                                      # ImageNet-1k shifted test sets: \\R{robust1k/<m>}{avg|v2|...}
+        for m in list(IN1K_ROWS) + ["abl_no_gates"]:
+            src = IN1K_VIPER if m == OURS else m
+            if src in R1k and all(R1k[src][k] for k, _ in ROBUST_SETS):
+                per = {k: np.mean(list(R1k[src][k].values())) for k, _ in ROBUST_SETS}
+                per["avg"] = np.mean(list(per.values()))
+                for k, v in per.items():
+                    lines.append(f"\\expandafter\\def\\csname vr@robust1k/{m}@{k}\\endcsname{{{v:.2f}}}")
+        if OURS in r1k and "abl_no_gates" in r1k:                     # ImageNet-1k gates: ViPER vs its control
+            a1, b1 = seed_values(r1k[OURS]), seed_values(r1k["abl_no_gates"])
+            sh1 = sorted(set(a1) & set(b1))
+            if sh1:
+                t1 = paired_seed_test(a1, b1)
+                for k, v in (("d", f"{np.mean([a1[x] - b1[x] for x in sh1]):+.2f}"), ("n", str(len(sh1))),
+                             ("p", f"{t1['t_p']:.2f}" if t1["t_p"] == t1["t_p"] else "--")):
+                    lines.append(f"\\expandafter\\def\\csname vr@pair/in1kgate@{k}\\endcsname{{{v}}}")
+        bl = [m for m in IN1K_ROWS if m != OURS and m in r1k]
+        raw, ns = [], []
+        if OURS in r1k:
+            for m in bl:
+                a, b = seed_values(r1k[OURS]), seed_values(r1k[m])
+                t = paired_seed_test(a, b)
+                raw.append(t["t_p"]); ns.append(t["n"])
+                if t["diff"] != t["diff"]:                         # no shared seed yet: no macro
+                    continue
+                lines.append(f"\\expandafter\\def\\csname vr@pair/in1k_{m}@d\\endcsname{{{t['diff']:+.2f}}}")
+                lines.append(f"\\expandafter\\def\\csname vr@pair/in1k_{m}@n\\endcsname{{{t['n']}}}")
+            ok = [(m, p_, n_) for m, p_, n_ in zip(bl, raw, ns) if p_ == p_]
+            if len(ok) >= 3:                                       # sentence needs several multi-seed baselines
+                hd = holm({m: p_ for m, p_, _ in ok})
+                adj = [hd[m] for m, _, _ in ok]
+                for (m, _, _), q in zip(ok, adj):
+                    lines.append(f"\\expandafter\\def\\csname vr@pair/in1k_{m}@p\\endcsname{{{q:.3f}}}")
+                pmax = max(adj)
+                ptxt = "{<}0.001" if pmax < 1e-3 else "{\\le}" + format(pmax, ".3f")
+                lines.append(f"\\expandafter\\def\\csname vr@pair/in1k@pmax\\endcsname{{{ptxt}}}")
+                lines.append(f"\\expandafter\\def\\csname vr@pair/in1k@n\\endcsname{{{min(n_ for *_, n_ in ok)}}}")
+                lines.append(f"\\expandafter\\def\\csname vr@pair/in1k@k\\endcsname{{{len(ok)}}}")
+                diffs = []                                          # per-seed gains over every tested baseline
+                for m_, *_ in ok:
+                    a_, b_ = seed_values(r1k[OURS]), seed_values(r1k[m_])
+                    diffs += [a_[x] - b_[x] for x in set(a_) & set(b_)]
+                nmin, k_ = min(n_ for *_, n_ in ok), len(ok)
+                nmax = max(n_ for *_, n_ in ok)
+                nmin = f"{nmin}" if nmin == nmax else f"{nmin}--{nmax}"     # baselines may differ in seeds
+                if pmax < 0.05:
+                    sent = (f"Paired over {nmin} seeds, the gain over each of these {k_} baselines is significant "
+                            f"(Holm-corrected paired $t$-test, $p{ptxt}$).")
+                elif min(adj) < 0.05:                               # mixed: name the significant comparisons
+                    sig = [m for (m, _, _), q in zip(ok, adj) if q < 0.05]
+                    rest = [m for (m, _, _), q in zip(ok, adj) if q >= 0.05]
+                    nm = lambda ms: " and ".join(PE_INFO[m][0] for m in ms)
+                    ps = max(q for q, (m, _, _) in zip(adj, ok) if m in sig)
+                    pr = min(q for q, (m, _, _) in zip(adj, ok) if m in rest)
+                    lead = "ViPER leads on every paired seed; " if all(d_ > 0 for d_ in diffs) else ""
+                    sent = (lead + f"Holm-corrected paired $t$-tests over {nmin} seeds: significant against {nm(sig)} "
+                            f"($p{{\\le}}{ps:.3f}$), not against {nm(rest)} ($p{{\\ge}}{pr:.3f}$).")
+                else:
+                    allpos = all(d_ > 0 for d_ in diffs)
+                    sent = ((f"ViPER is ahead of each of these {k_} baselines on every paired seed "
+                             f"({min(diffs):+.2f} to {max(diffs):+.2f} points), " if allpos else
+                             f"Paired over {nmin} seeds, ")
+                            + f"but with {nmin} seeds the Holm-corrected paired $t$-tests are not significant "
+                              f"($p{ptxt}$).")
+                plist = ", ".join(f"{PE_INFO[m][0]} {q:.3f}" for (m, _, _), q in zip(ok, adj))   # supplement
+                lines.append(f"\\expandafter\\def\\csname vr@pair/in1k@plist\\endcsname{{{plist}}}")
+                lines.append(f"\\expandafter\\def\\csname vr@pair/in1k@sentence\\endcsname{{{sent}}}")
+    for tag_, g in (("tiny", "in100_deit_tiny"), ("base", "in100_deit_base"), ("flowers", "transfer/flowers102"),
+                    ("aircraft", "transfer/fgvc_aircraft"), ("dtd", "transfer/dtd"), ("eurosat", "transfer/eurosat")):
+        if not os.path.isdir(os.path.join(RES, g)):                                 # gates: ViPER vs w/o gates
+            continue
+        rg = load_group(os.path.join(RES, g))
+        if "viper" not in rg or "abl_no_gates" not in rg:
+            continue
+        a, b = seed_values(rg["viper"]), seed_values(rg["abl_no_gates"])
+        sh = sorted(set(a) & set(b))
+        if sh:
+            lines.append(f"\\expandafter\\def\\csname vr@pair/{tag_}@d224\\endcsname{{{np.mean([a[x] - b[x] for x in sh]):+.2f}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@pair/{tag_}@n224\\endcsname{{{len(sh)}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@pair/{tag_}@pos224\\endcsname{{{sum(a[x] > b[x] for x in sh)}}}")
+    for tag_p, gs in (("transfer", ("transfer/flowers102", "transfer/fgvc_aircraft", "transfer/dtd")),
+                      ("transfer4", ("transfer/flowers102", "transfer/fgvc_aircraft", "transfer/dtd", "transfer/eurosat"))):
+      pooled = {}                                                 # transfer: all (dataset, seed) pairs pooled
+      for g in gs:
+          if not os.path.isdir(os.path.join(RES, g)):
+              continue
+          rg = load_group(os.path.join(RES, g))
+          if "viper" in rg and "abl_no_gates" in rg:
+              a, b = seed_values(rg["viper"]), seed_values(rg["abl_no_gates"])
+              pooled.update({(g, x): a[x] - b[x] for x in set(a) & set(b)})
+      if len(pooled) > 2:
+          dv = np.array(list(pooled.values()))
+          from scipy.stats import ttest_1samp
+          for k, val in (("d", f"{dv.mean():+.2f}"), ("n", str(len(dv))), ("pos", str(int((dv > 0).sum()))),
+                         ("p", f"{ttest_1samp(dv, 0).pvalue:.3f}")):
+            lines.append(f"\\expandafter\\def\\csname vr@pair/{tag_p}@{k}\\endcsname{{{val}}}")
+    # --- review additions (Nov 15): decomposition of the ImageNet-100 margin, seed-level transfer / ADE20K tests,
+    #     original ImageNet-1k ViPER (disclosure)
+    from scipy.stats import ttest_1samp
+    def _m(name, k, v):
+        lines.append(f"\\expandafter\\def\\csname vr@{name}@{k}\\endcsname{{{v}}}")
+    m3 = load_group(os.path.join(RES, "in100_deit_small"))
+    if all(x in m3 for x in (OURS, "abl_no_gates")):
+        mu = {x: np.mean(list(seed_values(m3[x]).values())) for x in m3}
+        base = {x: v for x, v in mu.items() if x in PE_INFO and x != OURS}
+        best = max(base, key=base.get)
+        _m("maingap/ctl", "d", f"{mu['abl_no_gates'] - base[best]:+.2f}")          # two-path design vs best baseline
+        tot, ctl = round(mu[OURS] - base[best], 2), round(mu['abl_no_gates'] - base[best], 2)
+        _m("maingap/gate", "d", f"{tot - ctl:+.2f}")                              # gates, same seeds 0-2 (parts add up)
+    r1k_ = load_in1k()
+    if r1k_.get("viper_orig"):
+        v = list(seed_values(r1k_["viper_orig"]).values())
+        _m("in1korig", "top1", f"{np.mean(v):.2f}"); _m("in1korig", "std", f"{np.std(v, ddof=1):.2f}"); _m("in1korig", "n", len(v))
+        vv = [r["best_val_top1"] for r in r1k_["viper_orig"].values()]
+        _m("in1korig", "val", f"{np.mean(vv):.2f}")
+    for tag_p, gs in (("transferseed", ("transfer/flowers102", "transfer/fgvc_aircraft", "transfer/dtd")),
+                      ("transferseed4", ("transfer/flowers102", "transfer/fgvc_aircraft", "transfer/dtd", "transfer/eurosat"))):
+        per = defaultdict(list)                                    # seed-level: mean gain over the datasets per seed
+        for g in gs:
+            rg = load_group(os.path.join(RES, g)) if os.path.isdir(os.path.join(RES, g)) else {}
+            if "viper" in rg and "abl_no_gates" in rg:
+                a, b = seed_values(rg["viper"]), seed_values(rg["abl_no_gates"])
+                for x in set(a) & set(b):
+                    per[x].append(a[x] - b[x])
+        dv = np.array([np.mean(v) for v in per.values() if len(v) == len(gs)])
+        if len(dv) > 1:
+            _m(f"pair/{tag_p}", "d", f"{dv.mean():+.2f}"); _m(f"pair/{tag_p}", "n", len(dv))
+            _m(f"pair/{tag_p}", "pos", int((dv > 0).sum())); _m(f"pair/{tag_p}", "p", f"{ttest_1samp(dv, 0).pvalue:.2f}")
+    A = load_ade()
+    if "viper" in A and "abl_no_gates" in A:
+        sh = sorted(set(A["viper"]) & set(A["abl_no_gates"]))
+        dv = np.array([A["viper"][x]["miou"] - A["abl_no_gates"][x]["miou"] for x in sh])
+        if len(dv) > 1:
+            _m("ade/gatediff", "d", f"{dv.mean():+.2f}"); _m("ade/gatediff", "n", len(dv))
+            _m("ade/gatediff", "pos", int((dv > 0).sum())); _m("ade/gatediff", "p", f"{ttest_1samp(dv, 0).pvalue:.2f}")
+    gp, ap = os.path.join(RES, "analysis", "gates.json"), os.path.join(RES, "analysis", "attn_distance.json")
+    if os.path.exists(gp):
+        G = json.load(open(gp))
+        mean = np.mean([np.mean(g["mean"], 0) for g in G.values()], 0)
+        rho = [np.mean(g["rho_fine"], 0) for g in G.values()]
+        for b_ in range(len(mean)):
+            lines.append(f"\\expandafter\\def\\csname vr@ana/gate@b{b_ + 1}\\endcsname{{{mean[b_]:.2f}}}")
+            lo, hi = min(r[b_] for r in rho), max(r[b_] for r in rho)
+            lines.append(f"\\expandafter\\def\\csname vr@ana/rho@b{b_ + 1}\\endcsname{{{np.mean([r[b_] for r in rho]):.2f}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@ana/rho@b{b_ + 1}range\\endcsname{{{lo:.2f}--{hi:.2f}}}")
+    kj = os.path.join(RES, "analysis", "kernel.json")                            # effective kernels (analysis kernel)
+    if os.path.exists(kj):
+        Kk = json.load(open(kj)); R = Kk["R"]
+        dif = {l: np.abs(np.array(v["textured"]) - np.array(v["smooth"])).mean() for l, v in Kk["layers"].items()}
+        l = max(dif, key=dif.get); Ly = Kk["layers"][l]
+
+        def prof(z, k):                                                          # ring average at |D| = k, / centre
+            z = np.array(z)
+            return np.mean([z[R + dy, R + dx] for dy in range(-R, R + 1) for dx in range(-R, R + 1)
+                            if round(np.hypot(dx, dy)) == k]) / z[R, R]
+        for nm, val in (("layer", str(int(l) + 1)), ("t10", f"{prof(Ly['textured'], 10):.2f}"),
+                        ("s10", f"{prof(Ly['smooth'], 10):.2f}"), ("o10", f"{prof(Ly['ones'], 10):.2f}")):
+            lines.append(f"\\expandafter\\def\\csname vr@ana/kernel@{nm}\\endcsname{{{val}}}")
+        for b_ in range(len(Ly["g_textured"])):
+            lines.append(f"\\expandafter\\def\\csname vr@ana/kernel@gt{b_ + 1}\\endcsname{{{Ly['g_textured'][b_]:.2f}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@ana/kernel@gs{b_ + 1}\\endcsname{{{Ly['g_smooth'][b_]:.2f}}}")
+    at = os.path.join(RES, "analysis", "attn_texture.json")                      # attention distance by texture
+    if os.path.exists(at):
+        A = json.load(open(at))
+        dd = {r: np.array([np.array(A[k]["textured"]) - np.array(A[k]["smooth"]) for k in A if k.rsplit("_s", 1)[0] == r])
+              for r in ("viper", "abl_no_gates")}
+        if all(len(v) for v in dd.values()):
+            gap = dd["viper"].mean(0) - dd["abl_no_gates"].mean(0)
+            for nm, val in (("viper", f"{dd['viper'].mean():.2f}"), ("ctl", f"{dd['abl_no_gates'].mean():.2f}"),
+                            ("maxgap", f"{np.abs(gap).max():.2f}"), ("n", str(len(dd["viper"])))):
+                lines.append(f"\\expandafter\\def\\csname vr@ana/attntex@{nm}\\endcsname{{{val}}}")
+    Rb = load_group(os.path.join(RES, "in100_deit_small"), five=True)              # one band (B=1) vs ViPER and control
+    if "abl_bands1" in Rb:
+        b, v, c = (seed_values(Rb[m]) for m in ("abl_bands1", OURS, "abl_no_gates"))
+        sh = sorted(set(b) & set(v) & set(c))
+        if len(sh) >= 2:
+            tv = paired_seed_test({x: b[x] for x in sh}, {x: v[x] for x in sh})
+            tc = paired_seed_test({x: b[x] for x in sh}, {x: c[x] for x in sh})
+            val = lambda m: np.mean([Rb[m][x]["best_val_top1"] for x in sh])
+            for nm, val_ in (("top1", f"{np.mean([b[x] for x in sh]):.2f}"), ("viper", f"{np.mean([v[x] for x in sh]):.2f}"),
+                             ("ctl", f"{np.mean([c[x] for x in sh]):.2f}"), ("dviper", f"{tv['diff']:+.2f}"),
+                             ("pviper", f"{tv['t_p']:.2f}"), ("dctl", f"{tc['diff']:+.2f}"), ("pctl", f"{tc['t_p']:.2f}"),
+                             ("n", str(len(sh))), ("val", f"{val('abl_bands1'):.2f}"), ("valviper", f"{val(OURS):.2f}")):
+                lines.append(f"\\expandafter\\def\\csname vr@abl/bands1@{nm}\\endcsname{{{val_}}}")
+    gc = os.path.join(RES, "analysis", "gate_cost.json")                         # wavelet-branch cost (analysis gatecost)
+    if os.path.exists(gc):
+        C = json.load(open(gc))
+        for nm, val in (("mmac", f"{C['total_mmac']:.1f}"), ("dwt", f"{C['dwt_mmac']:.1f}"), ("net", f"{C['net_mmac']:.1f}"),
+                        ("params", f"{C['params'] / 1e3:.1f}K"), ("time", f"{100 * C['time_share']:.0f}"),
+                        ("pct", f"{100 * round(C['total_mmac'], 1) / (1e3 * round(_gflops_viper(), 2)):.2f}")):
+            lines.append(f"\\expandafter\\def\\csname vr@ana/gatecost@{nm}\\endcsname{{{val}}}")
+    Ra = load_ade()                                                               # ADE20K per-class IoU, ViPER vs each
+    if "viper" in Ra:
+        from scipy.stats import wilcoxon
+
+        def pci(m):
+            arr = [np.array(r["iou"]) for r in Ra[m].values() if r.get("iou") is not None]
+            return np.mean(arr, 0) if arr else None
+        v_, ps, wins = pci("viper"), [], []
+        for m in ("abl_no_gates", "string_cayley", "rope_mixed", "lookhere", "lepe"):
+            b_ = pci(m) if m in Ra else None
+            if v_ is None or b_ is None:
+                continue
+            ok = ~(np.isnan(v_) | np.isnan(b_))
+            w = int((v_[ok] > b_[ok]).sum()); wins.append(w); ps.append(wilcoxon(v_[ok], b_[ok]).pvalue)
+            lines.append(f"\\expandafter\\def\\csname vr@adecls/{m}@wins\\endcsname{{{w}}}")
+        if ps:
+            lines.append(f"\\expandafter\\def\\csname vr@adecls@winrange\\endcsname{{{min(wins)}--{max(wins)}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@adecls@pmax\\endcsname{{{max(ps):.3f}}}")
+    gv = os.path.join(RES, "analysis", "gatevar.json")                            # gate variance: within vs between images
+    if os.path.exists(gv):
+        G_ = json.load(open(gv)); fr = np.array([v["frac_within"] for v in G_.values()])
+        lines.append(f"\\expandafter\\def\\csname vr@ana/gatevar@within\\endcsname{{{100 * fr.mean():.0f}}}")
+        lines.append(f"\\expandafter\\def\\csname vr@ana/gatevar@range\\endcsname{{{100 * fr.min():.0f}--{100 * fr.max():.0f}}}")
+    bo = os.path.join(RES, "analysis", "bandorder.json")                          # learned frequencies keep band order
+    if os.path.exists(bo):
+        B_ = json.load(open(bo))
+        od = np.array([v["ordered"] for v in B_.values()]); ins = np.array([v["inside"] for v in B_.values()])
+        lines.append(f"\\expandafter\\def\\csname vr@ana/bandorder@ordered\\endcsname{{{100 * od.min():.0f}}}")
+        lines.append(f"\\expandafter\\def\\csname vr@ana/bandorder@inside\\endcsname{{{100 * ins.mean():.0f}}}")
+    for tfile, tpre in (("texture_gain.json", "tex"), ("texture_gain_in1k.json", "tex1k")):   # Fig. 8 / IN-1k
+      tg = os.path.join(RES, "analysis", tfile)
+      if os.path.exists(tg):
+        T = json.load(open(tg))
+        for key, nm in (("acc", "all"), ("acc_within_class", "wc")):
+            A = T.get(key, {})
+            if "viper" not in A or "abl_no_gates" not in A:
+                continue
+            sh = sorted(set(A["viper"]) & set(A["abl_no_gates"]))
+            d = np.array([np.array(A["viper"][x]["224"]) - np.array(A["abl_no_gates"][x]["224"]) for x in sh])
+            qr = d[:, 0] - d[:, 1:].mean(1)
+            vals = {"q1": f"{d[:, 0].mean():+.2f}", "rest": f"{d[:, 1:].mean():+.2f}", "q1rest": f"{qr.mean():+.2f}",
+                    "neg": str(int((qr < 0).sum())), "n": str(len(sh)), "best": str(int(d.mean(0).argmax()) + 1),
+                    "q5": f"{d[:, 4].mean():+.2f}", "pos5": str(int((d[:, 4] > 0).sum())),
+                    "all": f"{d.mean():+.2f}"}
+            for k, v in vals.items():
+                lines.append(f"\\expandafter\\def\\csname vr@{tpre}/{nm}@{k}\\endcsname{{{v}}}")
+    nd = []                                                                       # gate branch: native vs resized input
+    for sd in range(5):
+        rd = os.path.join(RES, "in100_deit_small", f"viper_s{sd}")
+        nj, fj = os.path.join(rd, "multires_native_gate.json"), os.path.join(rd, "final.json")
+        if os.path.exists(nj) and os.path.exists(fj):                           # runs evaluated both ways
+            nd.append(json.load(open(nj))["448"] - json.load(open(fj))["multires"]["448"]["extrapolate"]["top1"])
+    if nd:
+        lines.append(f"\\expandafter\\def\\csname vr@ana/natgate@d448\\endcsname{{{np.mean(nd):.1f}}}")
+        lines.append(f"\\expandafter\\def\\csname vr@ana/natgate@n\\endcsname{{{len(nd)}}}")
+    gf = os.path.join(RES, "analysis", "gatefreeze.json")                       # test-time gate interventions
+    if os.path.exists(gf):
+        F = json.load(open(gf))
+        V = {v: np.array([F[k][v] for k in F]) for v in ("full", "img_mean", "shuffle", "data_mean", "ones")}
+        for v, arr in V.items():
+            nm = v.replace("_", "")
+            lines.append(f"\\expandafter\\def\\csname vr@ana/freeze@{nm}\\endcsname{{{arr.mean():.2f}}}")
+            if v != "full":
+                d = arr - V["full"]
+                lines.append(f"\\expandafter\\def\\csname vr@ana/freeze@d{nm}\\endcsname{{{d.mean():.1f}}}")
+                lines.append(f"\\expandafter\\def\\csname vr@ana/freeze@r{nm}\\endcsname{{{(-d).min():.1f}--{(-d).max():.1f}}}")
+        lines.append(f"\\expandafter\\def\\csname vr@ana/freeze@n\\endcsname{{{len(F)}}}")
+    eq = os.path.join(RES, "analysis", "equiv.json")                             # Prop. 2 shift test (analysis equiv)
+    if os.path.exists(eq):
+        E = json.load(open(eq))
+        for k in ("crop", "circular", "spread"):
+            lines.append(f"\\expandafter\\def\\csname vr@ana/equiv@{k}\\endcsname{{{E[k]['mean']:.3f}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@ana/equiv@{k}max\\endcsname{{{E[k]['max']:.2f}}}")
+    if os.path.exists(ap):
+        for k, v in json.load(open(ap)).items():
+            m = k.rsplit("_s", 1)[0]
+            lines.append(f"\\expandafter\\def\\csname vr@ana/attn/{m}@early\\endcsname{{{np.mean(v[:4]):.1f}}}")
+            lines.append(f"\\expandafter\\def\\csname vr@ana/attn/{m}@last\\endcsname{{{v[-1]:.1f}}}")
+    for f in glob.glob(os.path.join(RES, "analysis", "probe_*.json")):
+        P = json.load(open(f))
+        m = os.path.basename(f)[6:-5]
+        for l in ("4", "12"):
+            lines.append(f"\\expandafter\\def\\csname vr@probe/{m}@l{l}\\endcsname{{{(P[l]['r2_x'] + P[l]['r2_y']) / 2:.2f}}}")
+    for m, sets in load_robust().items():
+        for k, v in sets.items():
+            lines.append(f"\\expandafter\\def\\csname vr@rob/{m}@{k}\\endcsname{{{np.mean(list(v.values())):.2f}}}")
+        seeds = set.intersection(*(set(v) for v in sets.values())) if sets else set()
+        if len(sets) == len(ROBUST_SETS) and seeds:
+            avg = np.mean([np.mean([sets[k][sd] for k, _ in ROBUST_SETS]) for sd in seeds])
+            lines.append(f"\\expandafter\\def\\csname vr@rob/{m}@avg\\endcsname{{{avg:.2f}}}")
+    budget = {}
+    for grp in ("in100_deit_small", "in100_candidates", "pilot_in100_30ep", "in100_deit_tiny", "in100_deit_base"):
+        hrs = [json.load(open(f)).get("train_time_h", 0) for f in glob.glob(os.path.join(RES, grp, "*", "final.json"))
+               if not os.path.islink(os.path.dirname(f))]
+        budget[grp] = (len(hrs), sum(hrs))
+    for k_, pat in (("in1k", "in1k_deit_small/*/final.json"), ("transfer", "transfer/[!e]*/*/final.json")):
+        hrs = []                                                  # GPU-hours: wall-clock x world size
+        for f in glob.glob(os.path.join(RES, pat)):
+            if os.path.islink(os.path.dirname(f)):
+                continue
+            cf = os.path.join(os.path.dirname(f), "config.json")
+            ws = json.load(open(cf)).get("world_size", 1) if os.path.exists(cf) else 1
+            hrs.append(json.load(open(f)).get("train_time_h", 0) * ws)
+        budget[k_] = (len(hrs), sum(hrs))
+    ade = [json.load(open(f)).get("train_time_h", 0) for f in glob.glob(os.path.join(RES, "ade20k_deit_small", "*", "final.json"))]
+    budget["ade20k"] = (len(ade), sum(ade))
+    for k, (n, h) in budget.items():
+        lines.append(f"\\expandafter\\def\\csname vr@budget/{k}@runs\\endcsname{{{n}}}")
+        lines.append(f"\\expandafter\\def\\csname vr@budget/{k}@hours\\endcsname{{{h:,.0f}}}")
+    tot_n, tot_h = sum(n for n, _ in budget.values()), sum(h for _, h in budget.values())
+    lines.append(f"\\expandafter\\def\\csname vr@budget/total@runs\\endcsname{{{tot_n}}}")
+    lines.append(f"\\expandafter\\def\\csname vr@budget/total@hours\\endcsname{{{tot_h:,.0f}}}")
+    for m, rs in load_ade().items():
+        vals = [r["miou"] for r in rs.values()]
+        lines.append(f"\\expandafter\\def\\csname vr@ade/{m}@miou\\endcsname{{{np.mean(vals):.2f}}}")
+        lines.append(f"\\expandafter\\def\\csname vr@ade/{m}@n\\endcsname{{{len(vals)}}}")
+    for f in ("efficiency_deit_small.json", "efficiency_extra_deit_small.json"):
+        pth = os.path.join(RES, f)
+        if os.path.exists(pth):
+            for m, x in json.load(open(pth))["results"].items():
+                for k, v in (("infer", f"{x['infer_img_s']:,.0f}"), ("train", f"{x['train_img_s']:,.0f}"),
+                             ("mem", f"{x['peak_mem_gb']:.1f}"), ("params", f"{x['pe_params']/1e3:.1f}K"),
+                             ("gflops", f"{x['gflops']:.2f}")):
+                    lines.append(f"\\expandafter\\def\\csname vr@eff/{m}@{k}\\endcsname{{{v}}}")
+    lines.append("\\makeatother")
+    os.makedirs(OUT, exist_ok=True)
+    open(os.path.join(OUT, "numbers.tex"), "w").write("\n".join(lines) + "\n")
+    return f"{len(lines) - 4} macros"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.parse_args()
+    status = {
+        "numbers": write_numbers(),
+        "tab_pilot": table_pilot(),
+        "tab_valuepath": table_valuepath(),
+        "tab_main_in100": table_main(),
+        "tab_twopath": table_twopath(res_cols=(160,)),
+        "tab_ade20k": table_ade20k(),
+        "tab_scale": table_scale(),
+        "tab_scale_full": table_scale(full=True),
+        "tab_scale_res": table_scale_res(),
+        "tab_robust": table_robust(),
+        "tab_robust_in1k": table_robust_in1k(),
+        "tab_resfull": table_resfull(),
+        "tab_calib": table_calib(),
+        "tab_ablation": table_ablation_cases(),   # main paper: design-space layout
+        "tab_transfer": table_transfer(),
+        "tab_in1k": table_in1k(),
+        "tab_gatefreeze": table_gatefreeze(),
+        "tab_ade20k_full": table_ade20k(full=True),
+        "tab_ablation_full": table_ablation(full=True),
+        "tab_interp": table_interp(),
+        "tab_domain_acc": table_domain(key="top1", tag="acc"),
+        "tab_domain_f1": table_domain(key="macro_f1", tag="f1"),
+        "tab_efficiency": table_efficiency(subset={"none", "learned", "cpe", "lepe", "lookhere", "irpe", "rope_mixed",
+                                                   "liere", "comrope_ld", "string_cayley", "abl_no_gates", "viper"}),
+        "tab_efficiency_full": table_efficiency(fname="tab_efficiency_full.tex", label="tab:efficiency_full"),
+        "tab_significance": table_significance(),
+    }
+    os.makedirs(OUT, exist_ok=True)
+    for k, v in status.items():          # placeholder so the paper always compiles
+        p = os.path.join(OUT, k + ".tex")
+        if not os.path.exists(p):
+            write(k + ".tex", f"\\begin{{table}}[t]\\centering\\fbox{{\\parbox{{0.9\\columnwidth}}{{\\centering "
+                              f"\\texttt{{{k.replace('_', chr(92) + '_')}}}: pending ({v})}}}}\\label{{tab:{k[4:]}}}\\end{{table}}\n")
+    with open(os.path.join(OUT, "status.md"), "w") as f:
+        for k, v in status.items():
+            f.write(f"- {k}: {v}\n")
+            print(f"{k}: {v}")
+
+
+if __name__ == "__main__":
+    main()

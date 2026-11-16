@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project
+data/raw/
+data/processed/
+outputs/
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+
+# Anonymization safety
+**/personal_info*
+**/author_info*
+**/contact*
+
+# OS
+.DS_Store
+Thumbs.db
